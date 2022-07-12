@@ -11,10 +11,11 @@ enum Exchange{Coinbase};
  * Trader class
  */
 public class Trader {
-    private int traderCurrency;
-    private int traderExchange;
+    private int currency;
+    private int exchange;
     private String dataFilePath;
     private File dataFile;
+    private ArrayList<Float> dataFilePrice;
     private int threshold;
 
     /**
@@ -31,8 +32,13 @@ public class Trader {
         this.threshold = threshold;
     }
 
+    /**
+     * Prints all lines in the dataFile
+     */
     public void dataFilePrint() {
+        /* Try catch block for printing dataFile */
         try {
+            /* Scan through dataFileStream */
             Scanner dataFileStream = new Scanner(this.dataFile);
             while (dataFileStream.hasNext()) {
                 String dataFileLine = dataFileStream.nextLine();
@@ -43,8 +49,44 @@ public class Trader {
         }
     }
 
+    /**
+     * Parses column values of each line in the datafile into an ArrayList
+     */
+    public void dataFileParsePrice(String columnPriceName) {
+        /* Processing variables */
+        String[] dataFileLine;
+        int columnIndexPrice = 0;
+        int currentRow = 0;
+        /* Define ArrayList */
+        dataFilePrice = new ArrayList<Float>();
+        try {
+            /* Scan through dataFileStream */
+            Scanner dataFileStream = new Scanner(this.dataFile);
+            /* Parse the title line of the CSV */
+            dataFileLine = dataFileStream.nextLine().split(",");
+            for (int i = 0; i < dataFileLine.length; i++) {
+                /* If the column matches parameters */
+                if (dataFileLine[i].equals(columnPriceName)) {
+                    columnIndexPrice = i;
+                    break;
+                } 
+            }
+            /* Parse all data lines of the CSV */
+            while (dataFileStream.hasNext()) {
+                dataFileLine = dataFileStream.nextLine().split(",");
+                dataFilePrice.add(Float.parseFloat(dataFileLine[columnIndexPrice]));
+                currentRow++;
+            }
+        } catch (FileNotFoundException e) {
+            e.printStackTrace();
+        }
+    }
+
     public static void main(String[] args) {
         Trader trader = new Trader("Binance_BTCAUD_1h.csv", 10);
-        trader.dataFilePrint();
+        trader.dataFileParsePrice("close");
+        for(int i = 0; i < trader.dataFilePrice.size(); i++) {
+            System.out.println(trader.dataFilePrice.get(i));
+        }
     }
 }
