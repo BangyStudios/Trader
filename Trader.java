@@ -82,6 +82,11 @@ public class Trader {
         }
     }
 
+
+    public ArrayList<Integer> dataFileRecognizeBottoms() {
+        return null;
+    }
+
     public static void main(String[] args) {
         Trader trader = new Trader("Binance_BTCAUD_1h.csv", 10);
         trader.dataFileParsePrice("close");
