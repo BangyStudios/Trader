@@ -57,10 +57,10 @@ impl CoinSpot {
                 println!("JSON parsing error: {}", e);
                 e
             })?;
-            return Ok(response_json)
+            Ok(response_json)
         } else {
             println!("Request failed with status: {}", response.status());
-            return Err("Request failed".into())
+            Err("Request failed".into())
         }
     }
 
