@@ -5,19 +5,30 @@ use reqwest::header::{ HeaderMap, HeaderValue };
 use serde_json::Value;
 
 pub struct CoinSpot {
-    config: Config, 
     api_key: String, 
     api_secret: String
 }
 
 impl CoinSpot {
     pub fn init(config: Config) -> Self {
-        let api_key = config.get("coinspot_api_key").unwrap_or("Fuck!").to_string();
-        let api_secret = config.get("coinspot_api_secret").unwrap_or("Fuck!").to_string();
-        CoinSpot { config, api_key, api_secret }
+        let api_key = match config.get("coinspot_api_key") {
+            Some(api_key) => String::from(api_key), 
+            None => {
+                eprintln!("api.CoinSpot.init: Unable to retrieve api_key from config.");
+                String::new()
+            }
+        };
+        let api_secret = match config.get("coinspot_api_secret") {
+            Some(api_secret) => String::from(api_secret), 
+            None => {
+                eprintln!("api.CoinSpot.init: Unable to retrieve api_secret from config.");
+                String::new()
+            }
+        };
+        return CoinSpot { api_key, api_secret }
     }
 
-    pub fn print(&self) -> String {
+    pub fn print_api_key(&self) -> String {
         format!("API Key: {}, API Secret: {}", self.api_key, self.api_secret)
     }
 
@@ -46,16 +57,24 @@ impl CoinSpot {
                 println!("JSON parsing error: {}", e);
                 e
             })?;
-            Ok(response_json)
+            return Ok(response_json)
         } else {
             println!("Request failed with status: {}", response.status());
-            Err("Request failed".into())
+            return Err("Request failed".into())
         }
     }
 
     pub async fn get_price_coin(&self, coin: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
         let json_value = self.get_prices().await?;
         let price_info = json_value["prices"][coin].clone();
-        Ok(if price_info.is_null() { None } else { Some(price_info) })
+        Ok(
+            if price_info.is_null() { 
+                None 
+            } else { 
+                Some(price_info) 
+            }
+        )
     }
+
+
  }
