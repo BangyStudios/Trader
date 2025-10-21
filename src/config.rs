@@ -12,7 +12,7 @@ impl Config {
         Config { data }
     }
 
-    pub fn get(&self, key: &str) -> Option<&str> {
+    pub fn get_config(&self, key: &str) -> Option<&str> {
         self.data.get(key).and_then(|value| value.as_str())
     }
 }

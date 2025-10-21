@@ -1,8 +1,14 @@
+use crate::api::CExClient;
 use crate::config::Config;
 
-use reqwest;
-use reqwest::header::{ HeaderMap, HeaderValue };
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
+
+pub fn init_cex_client(config: &crate::config::Config) -> Result<Box<dyn CExClient>> {
+    Ok(Box::new(CoinSpot::init(&config)?))
+}
 
 pub struct CoinSpot {
     api_key: String, 
@@ -10,29 +16,28 @@ pub struct CoinSpot {
 }
 
 impl CoinSpot {
-    pub fn init(config: Config) -> Self {
-        let api_key = match config.get("coinspot_api_key") {
-            Some(api_key) => String::from(api_key), 
-            None => {
-                eprintln!("api.CoinSpot.init: Unable to retrieve api_key from config.");
-                String::new()
-            }
-        };
-        let api_secret = match config.get("coinspot_api_secret") {
-            Some(api_secret) => String::from(api_secret), 
-            None => {
-                eprintln!("api.CoinSpot.init: Unable to retrieve api_secret from config.");
-                String::new()
-            }
-        };
-        return CoinSpot { api_key, api_secret }
+    pub fn init(config: &Config) -> Result<Self> {
+        let api_key = config
+            .get_config("coinspot_api_key")
+            .ok_or_else(|| anyhow!("Missing coinspot_api_key in config"))?
+            .to_string();
+
+        let api_secret = config
+            .get_config("coinspot_api_secret")
+            .ok_or_else(|| anyhow!("Missing coinspot_api_secret in config"))?
+            .to_string();
+
+        Ok(Self { api_key, api_secret })
+    }
+}
+
+#[async_trait]
+impl CExClient for CoinSpot {
+    fn print_api_key(&self) -> anyhow::Result<String> {
+        Ok(format!("API Key: {}, API Secret: {}", self.api_key, self.api_secret))
     }
 
-    pub fn print_api_key(&self) -> String {
-        format!("API Key: {}, API Secret: {}", self.api_key, self.api_secret)
-    }
-
-    pub async fn get_prices(&self) -> Result<Value, Box<dyn std::error::Error>> {
+    async fn get_prices(&self) -> anyhow::Result<serde_json::Value> {
         let mut headers = HeaderMap::new();
         headers.insert("key", HeaderValue::from_str(&self.api_key)?);
         headers.insert("sign", HeaderValue::from_str(&self.api_secret)?);
@@ -60,11 +65,11 @@ impl CoinSpot {
             Ok(response_json)
         } else {
             println!("Request failed with status: {}", response.status());
-            Err("Request failed".into())
+            Err(anyhow::format_err!("Request failed"))
         }
     }
 
-    pub async fn get_price_coin(&self, coin: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+    async fn get_price_coin(&self, coin: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let json_value = self.get_prices().await?;
         let price_info = json_value["prices"][coin].clone();
         Ok(
