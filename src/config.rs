@@ -1,6 +1,7 @@
 use std::fs;
 use toml;
 
+#[derive(Clone)]
 pub struct Config {
     data: toml::Value,
 }

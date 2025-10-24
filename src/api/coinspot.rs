@@ -1,10 +1,22 @@
 use crate::api::CExClient;
 use crate::config::Config;
 
+use crate::utils;
+
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
+use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+use hmac::{Hmac, Mac};
+use sha2::Sha512;
+
+#[derive(Serialize)]
+struct Payload {
+    nonce: String,
+}
 
 pub fn init_cex_client(config: &crate::config::Config) -> Result<Box<dyn CExClient>> {
     Ok(Box::new(CoinSpot::init(&config)?))
@@ -12,11 +24,15 @@ pub fn init_cex_client(config: &crate::config::Config) -> Result<Box<dyn CExClie
 
 pub struct CoinSpot {
     api_key: String, 
-    api_secret: String
+    api_secret: String, 
+    client: reqwest::Client, 
+    config: Config
 }
 
 impl CoinSpot {
     pub fn init(config: &Config) -> Result<Self> {
+        let client = reqwest::Client::new();
+
         let api_key = config
             .get_config("coinspot_api_key")
             .ok_or_else(|| anyhow!("Missing coinspot_api_key in config"))?
@@ -27,7 +43,7 @@ impl CoinSpot {
             .ok_or_else(|| anyhow!("Missing coinspot_api_secret in config"))?
             .to_string();
 
-        Ok(Self { api_key, api_secret })
+        Ok(Self { api_key, api_secret, client, config: config.clone() })
     }
 }
 
@@ -42,9 +58,8 @@ impl CExClient for CoinSpot {
         headers.insert("key", HeaderValue::from_str(&self.api_key)?);
         headers.insert("sign", HeaderValue::from_str(&self.api_secret)?);
     
-        let client = reqwest::Client::new();
-        let response = client
-            .get("https://www.coinspot.com.au/pubapi/latest")
+        let response = self.client
+            .get("https://www.coinspot.com.au/pubapi/v2/latest")
             .headers(headers)
             .send()
             .await
@@ -81,5 +96,63 @@ impl CExClient for CoinSpot {
         )
     }
 
+    async fn get_sign_body(&self, body: &str) -> String {
+        let mut mac = Hmac::<Sha512>::new_from_slice(self.api_secret.as_bytes())
+            .expect("HMAC can take key of any size");
+        mac.update(body.as_bytes());
+        let sign = hex::encode(mac.finalize().into_bytes());
+        
+        sign
+    }
 
+    async fn get_quote_coin_buy(&self, coin: &str, amount: &f64) -> anyhow::Result<Option<serde_json::Value>> {
+        let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_millis()
+        .to_string();
+
+        let amounttype = "coin";
+
+        let body = format!(
+            r#"{{"nonce":"{}","cointype":"{}","amount":{},"amounttype":"{}"}}"#,
+            &nonce,
+            &coin,
+            &amount, 
+            &amounttype
+        );
+
+        let sign = self.get_sign_body(&body).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("key", HeaderValue::from_str(&self.api_key)?);
+        headers.insert("sign", HeaderValue::from_str(&sign)?);
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let response = self.client
+            .post("https://www.coinspot.com.au/api/v2/quote/buy/now")
+            .headers(headers)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| {
+                println!("Request error: {}", e);
+                e
+            })?;
+    
+        if response.status().is_success() {
+            let response_body = response.text().await.map_err(|e| {
+                println!("Response error: {}", e);
+                e
+            })?;
+            let response_json: Value = serde_json::from_str(&response_body).map_err(|e| {
+                println!("JSON parsing error: {}", e);
+                e
+            })?;
+            Ok(Some(response_json))
+        } else {
+            println!("Request failed with status: {}, {}", response.status(), response.text().await.unwrap_or_default());
+            Err(anyhow::format_err!("Request failed"))
+        }
+    }
  }
