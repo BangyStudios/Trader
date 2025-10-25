@@ -1,8 +1,6 @@
 use crate::api::CExClient;
 use crate::config::Config;
 
-use crate::utils;
-
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -105,14 +103,12 @@ impl CExClient for CoinSpot {
         sign
     }
 
-    async fn get_quote_coin_buy(&self, coin: &str, amount: &f64) -> anyhow::Result<Option<serde_json::Value>> {
+    async fn get_quote_coin_buy(&self, coin: &str, amount: &f64, amounttype: &str) -> anyhow::Result<Option<serde_json::Value>> {
         let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_millis()
         .to_string();
-
-        let amounttype = "coin";
 
         let body = format!(
             r#"{{"nonce":"{}","cointype":"{}","amount":{},"amounttype":"{}"}}"#,

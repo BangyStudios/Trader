@@ -1,0 +1,8 @@
+db_user = "trader"
+db_pass = ""
+db_host = "localhost"
+db_name = "trader"
+coinspot_api_key = ""
+coinspot_api_secret = ""
+timestep_mins = 5
+salt = "salt1234"

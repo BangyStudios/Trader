@@ -2,6 +2,8 @@ use crate::api;
 use crate::config;
 use crate::database;
 
+use tokio::join;
+
 pub struct Daemon {
     config: config::Config, 
     database: database::Database, 
@@ -12,7 +14,7 @@ pub struct Daemon {
 impl Daemon {
     pub fn new(client_cex_name: &str) -> anyhow::Result<Self> {
         let config = config::Config::init();
-        let database = database::Database::init()?;
+        let database = database::Database::init(config.clone())?;
         
         let client_cex = match client_cex_name { 
             "coinspot" => api::coinspot::init_cex_client(&config)?,
@@ -34,7 +36,7 @@ impl Daemon {
     }
 
     pub async fn run(&self) {
-        self.loop_log_prices().await;
+        let (result) = join!(self.loop_log_prices());
     }
 
     pub async fn loop_log_prices(&self) {
@@ -63,20 +65,6 @@ impl Daemon {
                 }
                 Ok(None) => eprintln!("Price info not found for BTC."),
                 Err(e) => eprintln!("Error fetching BTC price: {}", e),
-            }
-
-            let coin = "BTC";
-            let amount = 1.0;
-            match self.client_cex.get_quote_coin_buy(&coin, &amount).await {
-                Ok(Some(quote_info)) => {
-                    println!("Quote info for {}: {}", &coin, &quote_info);
-                }
-                Ok(None) => {
-                    println!("No quote info found for {}", &coin);
-                }
-                Err(e) => {
-                    eprintln!("Error fetching quote info for {}: {}", &coin, e);
-                }
             }
 
             // Wait for the configured timestep before the next iteration

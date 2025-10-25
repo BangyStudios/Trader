@@ -1,8 +1,8 @@
+mod algorithm;
 mod api;
 mod config;
 mod daemon;
 mod database;
-mod utils;
 
 use tokio;
 use api::CExClient;

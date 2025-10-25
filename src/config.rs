@@ -8,7 +8,7 @@ pub struct Config {
 
 impl Config {
     pub fn init() -> Self {
-        let config_raw = fs::read_to_string("config.toml").expect("File cannot be read.");
+        let config_raw = fs::read_to_string("config/config.toml").expect("File cannot be read");
         let data: toml::Value = toml::from_str(&config_raw).unwrap();
         Config { data }
     }
