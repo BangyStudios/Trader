@@ -1,9 +1,11 @@
 use crate::config::Config;
+use chrono::{Utc, Local, Duration, DateTime, NaiveDateTime, NaiveTime};
 use mysql::*;
 use mysql::prelude::*;
 
 pub struct Database {
-    pool: Pool,
+    pool: Pool, 
+    currencies_supported: Vec<String>
 }
 
 impl Database {
@@ -30,20 +32,67 @@ impl Database {
             )",
         )?;
 
-        Ok(Database { pool })
+
+        log::info!("Connected to database and ensured price_btc table exists.");
+
+        let currencies_supported = vec!["btc".to_string()]; // Example currencies
+        
+        Ok(Database { pool, currencies_supported })
+    }
+
+    pub fn load_prices_last(
+        &self, 
+        currency: &str, 
+        days: i32
+    ) -> anyhow::Result<Vec<f64>> {
+        if !self.currencies_supported.contains(&currency.to_string()) {
+            Err(anyhow::format_err!("Currency {} not currently supported", currency))?;
+        }
+
+        let query = format!(
+            r"SELECT price_last FROM price_{} 
+              WHERE timestamp >= :datetime_min AND timestamp < :datetime_max 
+              ORDER BY timestamp DESC",
+            currency
+        );
+
+        let datetime_min: NaiveDateTime = (Local::now() - Duration::days(days as i64)).with_time(NaiveTime::MIN).unwrap().naive_local();
+        let datetime_max: NaiveDateTime = (Local::now()).with_time(NaiveTime::MIN).unwrap().naive_local();
+
+        let mut conn = self.pool.get_conn()?;
+        let prices: Vec<f64> = conn.exec_map(
+            &query,
+            params! {
+                "datetime_min" => datetime_min.to_string(), 
+                "datetime_max" => datetime_max.to_string()
+            },
+            |price_last: f64| price_last,
+        )?;
+
+        Ok(prices)
     }
 
     /// Logs the current BTC price to the database
-    pub fn log_price_btc(
-        &self,
+    pub fn save_price(
+        &self, 
+        currency: &str, 
         price_buy: f64,
         price_sell: f64,
         price_last: f64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> anyhow::Result<()> {
+        if !self.currencies_supported.contains(&currency.to_string()) {
+            Err(anyhow::format_err!("Currency {} not currently supported", currency))?;
+        }
+
+        let query = format!(
+            r"INSERT INTO price_{} (price_buy, price_sell, price_last)
+              VALUES (:price_buy, :price_sell, :price_last)",
+            currency
+        );
+
         let mut conn = self.pool.get_conn()?;
         conn.exec_drop(
-            r"INSERT INTO price_btc (price_buy, price_sell, price_last)
-              VALUES (:price_buy, :price_sell, :price_last)",
+            &query,
             params! {
                 "price_buy" => price_buy,
                 "price_sell" => price_sell,

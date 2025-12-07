@@ -1,5 +1,6 @@
 use std::fs;
 use toml;
+use log;
 
 #[derive(Clone)]
 pub struct Config {
@@ -8,8 +9,9 @@ pub struct Config {
 
 impl Config {
     pub fn init() -> Self {
-        let config_raw = fs::read_to_string("config/config.toml").expect("File cannot be read");
+        let config_raw = fs::read_to_string("./config/config.toml").expect("File cannot be read");
         let data: toml::Value = toml::from_str(&config_raw).unwrap();
+        log::info!("Configuration loaded successfully.");
         Config { data }
     }
 
