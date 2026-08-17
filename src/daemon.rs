@@ -1,25 +1,35 @@
+use crate::algorithm;
+use crate::algorithm::Algorithm;
 use crate::api;
 use crate::config;
 use crate::database;
+use crate::quant::moving_average::get_timeseries_ma_trailing;
+use crate::utils;
 
 use chrono::{DateTime, Timelike, Utc};
+use std::sync::Arc;
 use tokio::join;
 
 pub struct Daemon {
-    config: config::Config, 
-    database: database::Database, 
-    client_cex: Box<dyn api::CExClient>, 
-    timestep_mins: u32, 
+    config: config::Config,
+    database: database::Database,
+    client_cex: Box<dyn api::CExClient>,
+    timestep_mins: u32,
 }
 
 impl Daemon {
     pub fn new(client_cex_name: &str) -> anyhow::Result<Self> {
         let config = config::Config::init();
         let database = database::Database::init(config.clone())?;
-        
-        let client_cex = match client_cex_name { 
+
+        let client_cex = match client_cex_name {
             "coinspot" => api::coinspot::init_cex_client(&config)?,
-            _ => return Err(anyhow::format_err!("Unsupported CEx client: {}", client_cex_name)),
+            _ => {
+                return Err(anyhow::format_err!(
+                    "Unsupported CEx client: {}",
+                    client_cex_name
+                ))
+            }
         };
 
         let timestep_mins = config
@@ -28,53 +38,61 @@ impl Daemon {
             .parse::<u32>()
             .unwrap_or(5);
 
-        return Ok(Daemon { 
-            config, 
-            database, 
-            client_cex, 
-            timestep_mins
-        })
+        return Ok(Daemon {
+            config,
+            database,
+            client_cex,
+            timestep_mins,
+        });
     }
 
     pub async fn run(&self) {
-        let (result) = join!(self.loop_log_prices());
+        let (
+            result_log_prices, 
+            result_run_algorithm
+        ) = join!(
+            self.loop_log_prices(), 
+            self.loop_run_algorithm()
+        );
     }
 
     pub async fn get_seconds_to_timestep_next(&self) -> u32 {
         let datetime_now = Utc::now();
-        
+
         let minute_now = datetime_now.minute();
         let second_now = datetime_now.second();
         let minutes_past = minute_now % self.timestep_mins;
 
         let mut sync = 0;
-        
+
         let minutes_to_add = if minutes_past == self.timestep_mins - 1 && second_now >= 55 {
             // Within last 5 seconds of the interval, wait full interval
             sync = second_now as i32 - 60;
             self.timestep_mins
-        } else if  minutes_past == 0 && second_now == 0 {
+        } else if minutes_past == 0 && second_now == 0 {
             // Exactly at boundary, go to next interval
             self.timestep_mins
         } else {
             // Not at boundary, go to next boundary
             self.timestep_mins - minutes_past
         };
-        
+
         let next_timestep = if sync == 0 {
             (datetime_now + chrono::Duration::minutes(minutes_to_add as i64))
-            .with_second(0)
-            .and_then(|dt| dt.with_nanosecond(0))
-            .unwrap()
+                .with_second(0)
+                .and_then(|dt| dt.with_nanosecond(0))
+                .unwrap()
         } else {
-            (datetime_now + chrono::Duration::minutes(minutes_to_add as i64) + chrono::Duration::minutes(if sync < 0 { 1 } else { 0 } as i64))
+            (datetime_now
+                + chrono::Duration::minutes(minutes_to_add as i64)
+                + chrono::Duration::minutes(if sync < 0 { 1 } else { 0 } as i64))
             .with_second(0)
             .and_then(|dt| dt.with_nanosecond(0))
             .unwrap()
         };
 
         let duration = next_timestep.signed_duration_since(datetime_now);
-        duration.num_seconds().max(0) as u32  // Always at least 1 second
+        duration.num_seconds().max(0) as u32 // Always at least 1 second
     }
 
     pub async fn loop_log_prices(&self) {
@@ -91,10 +109,17 @@ impl Daemon {
 
                     match (price_last, price_buy, price_sell) {
                         (Some(price_last), Some(price_buy), Some(price_sell)) => {
-                            if let Err(e) = self.database.save_price("btc", price_buy, price_sell, price_last) {
+                            if let Err(e) = self.database
+                                .save_price("btc", price_buy, price_sell, price_last)
+                            {
                                 log::error!("Failed to log BTC prices: {}", e);
                             } else {
-                                log::info!("Logged BTC prices - Buy: {}, Sell: {}, Last: {}", price_buy, price_sell, price_last);
+                                log::info!(
+                                    "Logged BTC prices - Buy: {}, Sell: {}, Last: {}",
+                                    price_buy,
+                                    price_sell,
+                                    price_last
+                                );
                             }
                         }
                         _ => log::warn!("One or more BTC price fields are missing or invalid."),
@@ -104,11 +129,42 @@ impl Daemon {
                 Err(e) => log::error!("Error fetching BTC price: {}", e),
             }
 
+            let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
+            log::info!(
+                "Sleeping for {} seconds until next timestep.",
+                time_sleep_seconds
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(time_sleep_seconds.into())).await;
+        }
+    }
+
+    pub async fn loop_run_algorithm(&self) {
+        loop {
             println!("Test loading yesterday's prices");
-            let prices_last = self.database.load_prices_last("btc", 1);
+            // let prices_last = utils::timeseries::interpolate_linear(
+            //     &(self.database.load_prices_last("btc", 1).unwrap()),
+            //     288,
+            // );
+            let balance = match self.client_cex.get_balance().await {
+                Ok(response) => { 
+                    log::info!("{:?}", response);
+                    // match response.get()
+                }, 
+                Err(e) => { 
+                    log::error!("Error fetching CEx account balance: {}", e);
+                    continue;
+                }
+            };
+
+            let prices_last = self.database.get_prices_last("btc", 365 * 8 + 3, true).unwrap();
+            let moving_average = get_timeseries_ma_trailing(prices_last, "price_buy", 365 * 4 + 1).unwrap();
+            log::info!("{:?}", moving_average.last().map(|row| row.value.2));
 
             let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
-            log::info!("Sleeping for {} seconds until next timestep.", time_sleep_seconds);
+            log::info!(
+                "Sleeping for {} seconds until next timestep.",
+                time_sleep_seconds
+            );
             tokio::time::sleep(tokio::time::Duration::from_secs(time_sleep_seconds.into())).await;
         }
     }

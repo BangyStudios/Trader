@@ -1,6 +1,6 @@
+use log;
 use std::fs;
 use toml;
-use log;
 
 #[derive(Clone)]
 pub struct Config {

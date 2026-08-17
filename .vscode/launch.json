@@ -12,7 +12,8 @@
         "args": [],
         "cwd": "${workspaceFolder}",
         "env": {
-            "RUST_BACKTRACE": "1"
+            "RUST_BACKTRACE": "1",
+            "RUST_LOG": "info"
         },
         "sourceLanguages": ["rust"],
         "preLaunchTask": "rust: cargo build",

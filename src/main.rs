@@ -4,6 +4,9 @@ mod api;
 mod config;
 mod daemon;
 mod database;
+mod quant;
+mod structure;
+mod utils;
 
 use env_logger;
 use tokio;
