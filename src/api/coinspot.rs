@@ -208,8 +208,6 @@ impl CExClient for CoinSpot {
                     .and_then(|array| {
                         array.iter()
                         .map(|item| {
-
-                            // item is like { "AUD": { ... } } — get the one inner value, whatever the key is
                             let (currency, data) = item
                                 .as_object()
                                 .and_then(|obj| obj.iter().next())
@@ -224,7 +222,7 @@ impl CExClient for CoinSpot {
 
                             Ok(CExBalanceItem{ currency: currency.to_string(), value_fiat: value_fiat, value: value, rate: rate })
                         })
-                        .collect::<Result<Vec<CExBalanceItem>, anyhow::Error>>()
+                        .collect::<Result<CExBalance, anyhow::Error>>()
                     })?;
 
                 Ok(balance)

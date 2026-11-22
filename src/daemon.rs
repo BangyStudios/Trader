@@ -3,7 +3,10 @@ use crate::algorithm::Algorithm;
 use crate::api;
 use crate::config;
 use crate::database;
-use crate::quant::moving_average::get_timeseries_ma_trailing;
+use crate::quant::moving_average::{
+    get_timeseries_diff, 
+    get_timeseries_ma_trailing
+};
 use crate::utils;
 
 use chrono::{DateTime, Timelike, Utc};
@@ -158,7 +161,7 @@ impl Daemon {
 
             let prices_last = self.database.get_prices_last("btc", 365 * 8 + 3, true).unwrap();
             let moving_average = get_timeseries_ma_trailing(prices_last, "price_buy", 365 * 4 + 1).unwrap();
-            log::info!("{:?}", moving_average.last().map(|row| row.value.2));
+            log::info!("{:?}", moving_average.data.last().map(|row| row.value.2));
 
             let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
             log::info!(
