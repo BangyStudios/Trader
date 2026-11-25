@@ -32,6 +32,7 @@ pub fn get_timeseries_ma_trailing(price_rows: Vec<PriceRow>, column: &str, len_w
         "price_buy" => row.price_buy,
         "price_sell" => row.price_sell,
         "price_last" => row.price_last,
+        "price_mid" => (row.price_buy + row.price_sell) / 2.0,
         _ => 0.0,
     }).collect();
 

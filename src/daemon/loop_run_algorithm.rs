@@ -1,4 +1,4 @@
-use crate::algorithm::v1_0::Algorithm_Buy_v1_0;
+use crate::algorithm::v1_0::Algorithm_v1_0;
 use crate::algorithm::Algorithm;
 use crate::daemon::Daemon;
 use crate::quant::moving_average::get_timeseries_ma_trailing;
@@ -85,13 +85,17 @@ impl Daemon {
         let (price_buy, price_sell) = self.get_prices_coin("btc").await?;
 
         let prices_last = self.database.get_prices_last("btc", 365 * 8 + 3, true)?;
-        let ma_4y = get_timeseries_ma_trailing(prices_last, "price_buy", 365 * 4 + 1)?;
-        let purchases_7d = self.database.get_purchases_last(7)?;
+        let ma_4y = get_timeseries_ma_trailing(prices_last, "price_mid", 365 * 4 + 1)?;
+        let prices_30d = self.database.get_prices_last("btc", 30, false)?;
+        let mut purchases_7d = self.database.get_purchases_last(7)?;
+        // Dry runs ignore real purchases, so each run shows what a fresh start would buy
+        if !self.is_wet_run {
+            purchases_7d.data.clear();
+        }
 
         let params = AlgorithmParams {
-            deposit_7d: self.deposit_7d,
+            deposit_1d: self.deposit_1d,
             amount_buy_min: self.amount_buy_min,
-            timestep_mins: self.timestep_mins,
         };
         let input = AlgorithmInput {
             datetime_now: Local::now().naive_local(),
@@ -99,6 +103,7 @@ impl Daemon {
             price_buy,
             price_sell,
             ma_4y,
+            prices_30d,
             purchases_7d,
         };
 
@@ -138,7 +143,7 @@ impl Daemon {
     }
 
     pub async fn loop_run_algorithm(&self) {
-        let algorithm = Algorithm_Buy_v1_0 {};
+        let algorithm = Algorithm_v1_0 {};
         loop {
             match self.run_algorithm(&algorithm).await {
                 Ok(()) => {}

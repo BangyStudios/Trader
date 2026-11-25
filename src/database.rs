@@ -99,10 +99,14 @@ impl Database {
             .with_time(NaiveTime::MIN)
             .unwrap()
             .naive_local();
-        let datetime_max: NaiveDateTime = (Local::now())
-            .with_time(NaiveTime::MIN)
-            .unwrap()
-            .naive_local();
+        // Closing prices stop at midnight so today's partial day is excluded; intraday prices run up to now
+        let mut datetime_max: NaiveDateTime = Local::now().naive_local();
+        if closing {
+            datetime_max = (Local::now())
+                .with_time(NaiveTime::MIN)
+                .unwrap()
+                .naive_local();
+        }
 
         let mut conn = self.pool.get_conn()?;
         let prices: Vec<PriceRow> = conn.exec_map(

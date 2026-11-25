@@ -2,6 +2,7 @@
 name = "Trader"
 version = "0.1.0"
 edition = "2021"
+default-run = "Trader"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,10 +15,13 @@ hex = "0.4.3"
 hmac = "0.13"
 log = "0.4"
 mysql = { version = "28", features = ["chrono"] }
-rand = "0.9"
 reqwest = { version = "0.13", features = ["query"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 toml = "1"
+
+[[bin]]
+name = "simulator"
+path = "src/simulator.rs"

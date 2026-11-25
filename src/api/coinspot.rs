@@ -24,10 +24,26 @@ pub struct CoinSpot {
     slippage_buy_max: f64, // Percent the fill rate may rise above the quoted rate before CoinSpot cancels the buy, in [0, 1000]
 }
 
+/// CoinSpot checks `sign` against the body as JavaScript re-serializes it, which writes whole
+/// floats without a fraction (`1`, not serde's `1.0`); a mismatch is "failed signature"
+fn serialize_f64_js<Serializer: serde::Serializer>(
+    value: &f64,
+    serializer: Serializer,
+) -> std::result::Result<Serializer::Ok, Serializer::Error> {
+    // JavaScript's Number.MAX_SAFE_INTEGER
+    let value_integer_max = 9007199254740991.0;
+    let is_integer = value.fract() == 0.0 && value.abs() <= value_integer_max;
+    if is_integer {
+        return serializer.serialize_i64(*value as i64);
+    }
+    serializer.serialize_f64(*value)
+}
+
 #[derive(Serialize)]
 struct CoinSpotRequestQuote<'a> {
     nonce: String,
     cointype: &'a str,
+    #[serde(serialize_with = "serialize_f64_js")]
     amount: f64,
     amounttype: &'a str,
 }
@@ -37,8 +53,11 @@ struct CoinSpotRequestOrderBuyNow<'a> {
     nonce: String,
     cointype: &'a str,
     amounttype: &'a str,
+    #[serde(serialize_with = "serialize_f64_js")]
     amount: f64,
+    #[serde(serialize_with = "serialize_f64_js")]
     rate: f64,
+    #[serde(serialize_with = "serialize_f64_js")]
     threshold: f64,
     direction: &'a str,
 }
@@ -324,5 +343,28 @@ impl CExClient for CoinSpot {
             );
             Err(anyhow::format_err!("Request failed"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serialize_f64_js_matches_javascript() {
+        let request = CoinSpotRequestOrderBuyNow {
+            nonce: "1".to_string(),
+            cointype: "BTC",
+            amounttype: "aud",
+            amount: 1.0,
+            rate: 150234.57,
+            threshold: 1.0,
+            direction: "UP",
+        };
+        let body = serde_json::to_string(&request).expect("Request serializes");
+        assert_eq!(
+            body,
+            r#"{"nonce":"1","cointype":"BTC","amounttype":"aud","amount":1,"rate":150234.57,"threshold":1,"direction":"UP"}"#
+        );
     }
 }

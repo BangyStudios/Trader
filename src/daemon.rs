@@ -1,3 +1,4 @@
+mod loop_log_prices;
 mod loop_run_algorithm;
 
 use crate::api;
@@ -15,7 +16,7 @@ pub struct Daemon {
     database: database::Database,
     client_cex: Box<dyn api::CExClient>,
     timestep_mins: u32,
-    deposit_7d: f64,
+    deposit_1d: f64,
     amount_buy_min: Option<f64>,
     is_wet_run: bool, // Places real orders when true, otherwise only logs them
 }
@@ -37,9 +38,9 @@ impl Daemon {
 
         let timestep_mins: u32 = config.get_config("timestep_mins")?.unwrap_or(5);
 
-        let deposit_7d: f64 = config
-            .get_config("deposit_7d")?
-            .ok_or_else(|| anyhow::anyhow!("Missing 'deposit_7d' in config"))?;
+        let deposit_1d: f64 = config
+            .get_config("deposit_1d")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'deposit_1d' in config"))?;
         let amount_buy_min: Option<f64> = config.get_config("amount_buy_min")?;
 
         // Missing means dry run, so an incomplete config never trades
@@ -54,7 +55,7 @@ impl Daemon {
             database,
             client_cex,
             timestep_mins,
-            deposit_7d,
+            deposit_1d,
             amount_buy_min,
             is_wet_run,
         });
@@ -107,48 +108,5 @@ impl Daemon {
 
         let duration = next_timestep.signed_duration_since(datetime_now);
         duration.num_seconds().max(0) as u32 // Always at least 1 second
-    }
-
-    pub async fn loop_log_prices(&self) {
-        loop {
-            match self.client_cex.get_price_coin("btc").await {
-                Ok(Some(price_info)) => {
-                    let parse_price = |key: &str| -> Option<f64> {
-                        price_info[key].as_str()?.parse::<f64>().ok()
-                    };
-
-                    let price_last = parse_price("last");
-                    let price_buy = parse_price("ask");
-                    let price_sell = parse_price("bid");
-
-                    match (price_last, price_buy, price_sell) {
-                        (Some(price_last), Some(price_buy), Some(price_sell)) => {
-                            if let Err(e) = self.database
-                                .save_price("btc", price_buy, price_sell, price_last)
-                            {
-                                log::error!("Failed to log BTC prices: {}", e);
-                            } else {
-                                log::info!(
-                                    "Logged BTC prices - Buy: {}, Sell: {}, Last: {}",
-                                    price_buy,
-                                    price_sell,
-                                    price_last
-                                );
-                            }
-                        }
-                        _ => log::warn!("One or more BTC price fields are missing or invalid."),
-                    }
-                }
-                Ok(None) => log::warn!("Price info not found for BTC."),
-                Err(e) => log::error!("Error fetching BTC price: {}", e),
-            }
-
-            let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
-            log::info!(
-                "Sleeping for {} seconds until next timestep.",
-                time_sleep_seconds
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(time_sleep_seconds.into())).await;
-        }
     }
 }

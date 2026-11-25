@@ -1,6 +1,7 @@
 use chrono::NaiveDateTime;
 use std::fmt;
 
+#[derive(Clone)]
 pub struct PriceRow {
     pub id: i32,
     pub price_buy: f64,
@@ -9,11 +10,13 @@ pub struct PriceRow {
     pub timestamp: NaiveDateTime
 }
 
+#[derive(Clone)]
 pub struct TimeseriesRow<Value> {
     pub timestamp: NaiveDateTime,
     pub value: Value
 }
 
+#[derive(Clone)]
 pub struct Timeseries<Value> {
     pub columns: Vec<String>,
     pub data: Vec<TimeseriesRow<Value>>

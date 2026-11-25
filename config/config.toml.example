@@ -10,7 +10,7 @@ coingecko_base_url = "https://api.coingecko.com/api/v3"
 coingecko_vs_currency = "aud"
 coingecko_coin_id = "bitcoin"
 app_version = "local"
-deposit_7d = 100.0
+deposit_1d = 50
 # amount_buy_min = 1.0
 # Places real CoinSpot orders when true; dry run (log only) when false or missing
 is_wet_run = false

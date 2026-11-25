@@ -1,10 +1,9 @@
-use crate::structure::timeseries::{Timeseries, TimeseriesRow};
+use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
 use chrono::NaiveDateTime;
 
 pub struct AlgorithmParams {
-    pub deposit_7d: f64, // Amount deposited into CEx balance per week
+    pub deposit_1d: f64, // Amount deposited into CEx balance per day
     pub amount_buy_min: Option<f64>, // Minimum purchase amount per transaction
-    pub timestep_mins: u32, // Minutes between algorithm runs
 }
 
 pub struct AlgorithmInput {
@@ -12,7 +11,8 @@ pub struct AlgorithmInput {
     pub balance: f64, 
     pub price_buy: f64,
     pub price_sell: f64,
-    pub ma_4y: Timeseries<(f64, f64, f64)>, 
+    pub ma_4y: Timeseries<(f64, f64, f64)>,
+    pub prices_30d: Vec<PriceRow>, // Intraday prices for the last 30 days, up to datetime_now
     pub purchases_7d: Timeseries<(f64, f64, f64)>, 
 }
 
