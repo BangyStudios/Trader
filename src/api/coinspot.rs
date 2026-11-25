@@ -1,5 +1,5 @@
 // src/api/coinspot.rs
-use crate::api::{CExBalance, CExBalanceItem, CExClient};
+use crate::api::{CExBalance, CExBalanceItem, CExClient, CExOrderBuy};
 use crate::config::Config;
 
 use anyhow::{anyhow, Result};
@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use hmac::{Hmac, KeyInit, Mac};
 use log;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha512;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,28 +21,108 @@ pub struct CoinSpot {
     api_secret: String,
     client: reqwest::Client,
     config: Config,
+    slippage_buy_max: f64, // Percent the fill rate may rise above the quoted rate before CoinSpot cancels the buy, in [0, 1000]
+}
+
+#[derive(Serialize)]
+struct CoinSpotRequestQuote<'a> {
+    nonce: String,
+    cointype: &'a str,
+    amount: f64,
+    amounttype: &'a str,
+}
+
+#[derive(Serialize)]
+struct CoinSpotRequestOrderBuyNow<'a> {
+    nonce: String,
+    cointype: &'a str,
+    amounttype: &'a str,
+    amount: f64,
+    rate: f64,
+    threshold: f64,
+    direction: &'a str,
+}
+
+#[derive(Deserialize)]
+struct CoinSpotResponseStatus {
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CoinSpotResponseQuote {
+    rate: f64,
+}
+
+/// Milliseconds since the epoch; CoinSpot requires each nonce to exceed the previous one
+fn get_nonce() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System clock is after the epoch")
+        .as_millis()
+        .to_string()
 }
 
 impl CoinSpot {
     pub fn init(config: &Config) -> Result<Self> {
         let client = reqwest::Client::new();
 
-        let api_key = config
-            .get_config("coinspot_api_key")
-            .ok_or_else(|| anyhow!("Missing coinspot_api_key in config"))?
-            .to_string();
+        let api_key: String = config
+            .get_config("coinspot_api_key")?
+            .ok_or_else(|| anyhow!("Missing 'coinspot_api_key' in config"))?;
 
-        let api_secret = config
-            .get_config("coinspot_api_secret")
-            .ok_or_else(|| anyhow!("Missing coinspot_api_secret in config"))?
-            .to_string();
+        let api_secret: String = config
+            .get_config("coinspot_api_secret")?
+            .ok_or_else(|| anyhow!("Missing 'coinspot_api_secret' in config"))?;
 
         Ok(Self {
             api_key,
             api_secret,
             client,
             config: config.clone(),
+            slippage_buy_max: 1.0,
         })
+    }
+
+    /// Signs and POSTs `body`, returning the response body; errors unless the HTTP status
+    /// is a success and the CoinSpot `status` is "ok"
+    async fn push_request_signed(&self, url: &str, body: &str) -> anyhow::Result<String> {
+        let sign = self.get_sign_body(body).await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("key", HeaderValue::from_str(&self.api_key)?);
+        headers.insert("sign", HeaderValue::from_str(&sign)?);
+        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+        let response = self
+            .client
+            .post(url)
+            .headers(headers)
+            .body(body.to_string())
+            .send()
+            .await?;
+        let status_http = response.status();
+        let response_body = response.text().await?;
+        if !status_http.is_success() {
+            return Err(anyhow!(
+                "Request to '{}' failed with status {}, body: {}",
+                url,
+                status_http,
+                response_body
+            ));
+        }
+
+        let response_status: CoinSpotResponseStatus = serde_json::from_str(&response_body)?;
+        if response_status.status != "ok" {
+            let message = response_status.message.unwrap_or_default();
+            return Err(anyhow!(
+                "Request to '{}' returned status '{}': {}",
+                url,
+                response_status.status,
+                message
+            ));
+        }
+        Ok(response_body)
     }
 }
 
@@ -109,60 +189,62 @@ impl CExClient for CoinSpot {
     async fn get_quote_coin_buy(
         &self,
         coin: &str,
-        amount: &f64,
+        amount: f64,
         amounttype: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis()
-            .to_string();
+    ) -> anyhow::Result<f64> {
+        let cointype = coin.to_uppercase();
+        let request = CoinSpotRequestQuote {
+            nonce: get_nonce(),
+            cointype: &cointype,
+            amount,
+            amounttype,
+        };
+        let body = serde_json::to_string(&request)?;
+        let response_body = self
+            .push_request_signed("https://www.coinspot.com.au/api/v2/quote/buy/now", &body)
+            .await?;
 
-        let body = format!(
-            r#"{{"nonce":"{}","cointype":"{}","amount":{},"amounttype":"{}"}}"#,
-            nonce, coin, amount, amounttype
-        );
-
-        let sign = self.get_sign_body(&body).await;
-
-        let mut headers = HeaderMap::new();
-        headers.insert("key", HeaderValue::from_str(&self.api_key)?);
-        headers.insert("sign", HeaderValue::from_str(&sign)?);
-        headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-
-        let response = self
-            .client
-            .post("https://www.coinspot.com.au/api/v2/quote/buy/now")
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                log::error!("Request error: {}", e);
-                e
-            })?;
-
-        if response.status().is_success() {
-            let response_body = response.text().await.map_err(|e| {
-                log::error!("Response error: {}", e);
-                e
-            })?;
-            let response_json: Value = serde_json::from_str(&response_body).map_err(|e| {
-                log::error!("JSON parsing error: {}", e);
-                e
-            })?;
-            Ok(Some(response_json))
-        } else {
-            let status = response.status();
-            let body_text = response.text().await.unwrap_or_default();
-            log::error!(
-                "Request failed with status: {}, body: {}",
-                status,
-                body_text
-            );
-            Err(anyhow::format_err!("Request failed"))
-        }
+        let response: CoinSpotResponseQuote = serde_json::from_str(&response_body)?;
+        Ok(response.rate)
     }
+
+    async fn push_order_buy_now(
+        &self,
+        coin: &str,
+        amount: f64,
+        amounttype: &str,
+        rate: f64,
+    ) -> anyhow::Result<CExOrderBuy> {
+        let cointype = coin.to_uppercase();
+        let request = CoinSpotRequestOrderBuyNow {
+            nonce: get_nonce(),
+            cointype: &cointype,
+            amounttype,
+            amount,
+            rate,
+            threshold: self.slippage_buy_max,
+            direction: "UP",
+        };
+        let body = serde_json::to_string(&request)?;
+        let response_body = self
+            .push_request_signed("https://www.coinspot.com.au/api/v2/my/buy/now", &body)
+            .await?;
+
+        // The order has filled by now, so keep the raw body for reconciling a parse failure
+        let order: CExOrderBuy = match serde_json::from_str(&response_body) {
+            Ok(order) => order,
+            Err(e) => {
+                log::error!(
+                    "Buy-now order filled but response is unparseable: {}, body: {}",
+                    e,
+                    response_body
+                );
+                return Err(e.into());
+            }
+        };
+        Ok(order)
+    }
+
     async fn get_balance(&self) -> anyhow::Result<CExBalance> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

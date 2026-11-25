@@ -10,25 +10,40 @@ use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct CExBalanceItem {
-    currency: String, 
+    pub currency: String, 
     value_fiat: f64,
-    value: f64,
+    pub value: f64,
     rate: f64,
 }
 
 type CExBalance = Vec<CExBalanceItem>;
+
+/// A filled buy order
+#[derive(Debug, Deserialize)]
+pub struct CExOrderBuy {
+    pub coin: String,
+    pub market: String,
+    pub amount: f64, // Coin received
+    pub total: f64,  // Paid, in the market currency (AUD)
+}
 
 #[async_trait]
 pub trait CExClient: Send + Sync {
     async fn get_prices(&self) -> Result<Value>;
     async fn get_price_coin(&self, coin: &str) -> Result<Option<Value>>;
     async fn get_sign_body(&self, body: &str) -> String;
-    async fn get_quote_coin_buy(
+    /// Returns the quoted buy rate in AUD per coin
+    async fn get_quote_coin_buy(&self, coin: &str, amount: f64, amounttype: &str)
+        -> anyhow::Result<f64>;
+    /// Places a buy-now order that the CEx cancels if the rate has risen too far above
+    /// `rate`; errors unless the order filled
+    async fn push_order_buy_now(
         &self,
         coin: &str,
-        amount: &f64,
+        amount: f64,
         amounttype: &str,
-    ) -> anyhow::Result<Option<serde_json::Value>>;
+        rate: f64,
+    ) -> anyhow::Result<CExOrderBuy>;
     async fn get_balance(&self) -> anyhow::Result<CExBalance>;
     fn print_api_key(&self) -> Result<String>;
 }

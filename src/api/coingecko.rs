@@ -14,29 +14,24 @@ pub struct CoinGeckoPriceApi {
 }
 
 impl CoinGeckoPriceApi {
-    pub fn new(config: &Config) -> Self {
-        let base_url = config
-            .get_config("coingecko_base_url")
-            .unwrap_or("https://api.coingecko.com/api/v3")
-            .trim_end_matches('/')
-            .to_string();
+    pub fn new(config: &Config) -> Result<Self> {
+        let base_url: Option<String> = config.get_config("coingecko_base_url")?;
+        let base_url = base_url.unwrap_or("https://api.coingecko.com/api/v3".to_string());
+        let base_url = base_url.trim_end_matches('/').to_string();
 
-        let vs_currency = config
-            .get_config("coingecko_vs_currency")
-            .unwrap_or("aud")
-            .to_ascii_lowercase();
+        let vs_currency: Option<String> = config.get_config("coingecko_vs_currency")?;
+        let vs_currency = vs_currency.unwrap_or("aud".to_string()).to_ascii_lowercase();
 
-        let user_agent = format!(
-            "Trader-IDCA/{}",
-            config.get_config("app_version").unwrap_or("dev")
-        );
+        let app_version: Option<String> = config.get_config("app_version")?;
+        let app_version = app_version.unwrap_or("dev".to_string());
+        let user_agent = format!("Trader-IDCA/{}", app_version);
 
-        Self {
+        Ok(Self {
             client: Client::new(),
             base_url,
             vs_currency,
             user_agent,
-        }
+        })
     }
 
     pub async fn fetch_closing_prices(&self, coin: &str, n_days: u32) -> Result<Vec<f64>> {

@@ -1,12 +1,9 @@
-use crate::algorithm;
-use crate::algorithm::Algorithm;
+mod loop_run_algorithm;
+
 use crate::api;
 use crate::config;
 use crate::database;
-use crate::quant::moving_average::{
-    get_timeseries_diff, 
-    get_timeseries_ma_trailing
-};
+use crate::quant::moving_average::get_timeseries_diff;
 use crate::utils;
 
 use chrono::{DateTime, Timelike, Utc};
@@ -18,6 +15,9 @@ pub struct Daemon {
     database: database::Database,
     client_cex: Box<dyn api::CExClient>,
     timestep_mins: u32,
+    deposit_7d: f64,
+    amount_buy_min: Option<f64>,
+    is_wet_run: bool, // Places real orders when true, otherwise only logs them
 }
 
 impl Daemon {
@@ -35,17 +35,28 @@ impl Daemon {
             }
         };
 
-        let timestep_mins = config
-            .get_config("timestep_mins")
-            .unwrap_or("5")
-            .parse::<u32>()
-            .unwrap_or(5);
+        let timestep_mins: u32 = config.get_config("timestep_mins")?.unwrap_or(5);
+
+        let deposit_7d: f64 = config
+            .get_config("deposit_7d")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'deposit_7d' in config"))?;
+        let amount_buy_min: Option<f64> = config.get_config("amount_buy_min")?;
+
+        // Missing means dry run, so an incomplete config never trades
+        let is_wet_run: bool = config.get_config("is_wet_run")?.unwrap_or(false);
+        log::info!(
+            "Algorithm mode: {}",
+            if is_wet_run { "WET RUN (real orders)" } else { "dry run" }
+        );
 
         return Ok(Daemon {
             config,
             database,
             client_cex,
             timestep_mins,
+            deposit_7d,
+            amount_buy_min,
+            is_wet_run,
         });
     }
 
@@ -131,37 +142,6 @@ impl Daemon {
                 Ok(None) => log::warn!("Price info not found for BTC."),
                 Err(e) => log::error!("Error fetching BTC price: {}", e),
             }
-
-            let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
-            log::info!(
-                "Sleeping for {} seconds until next timestep.",
-                time_sleep_seconds
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(time_sleep_seconds.into())).await;
-        }
-    }
-
-    pub async fn loop_run_algorithm(&self) {
-        loop {
-            println!("Test loading yesterday's prices");
-            // let prices_last = utils::timeseries::interpolate_linear(
-            //     &(self.database.load_prices_last("btc", 1).unwrap()),
-            //     288,
-            // );
-            let balance = match self.client_cex.get_balance().await {
-                Ok(response) => { 
-                    log::info!("{:?}", response);
-                    // match response.get()
-                }, 
-                Err(e) => { 
-                    log::error!("Error fetching CEx account balance: {}", e);
-                    continue;
-                }
-            };
-
-            let prices_last = self.database.get_prices_last("btc", 365 * 8 + 3, true).unwrap();
-            let moving_average = get_timeseries_ma_trailing(prices_last, "price_buy", 365 * 4 + 1).unwrap();
-            log::info!("{:?}", moving_average.data.last().map(|row| row.value.2));
 
             let time_sleep_seconds = self.get_seconds_to_timestep_next().await;
             log::info!(

@@ -3,3 +3,8 @@
 Cargo.lock
 config.toml
 Cargo.toml
+
+# Private algorithms: only the example and module root are tracked
+/src/algorithm/*
+!/src/algorithm/mod.rs
+!/src/algorithm/example.rs

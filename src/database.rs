@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::structure::timeseries::PriceRow;
+use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
 use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, Utc};
 use mysql::prelude::*;
 use mysql::*;
@@ -14,14 +14,21 @@ pub struct Database {
 impl Database {
     /// Creates a new Database instance and initializes the `price_btc` table if it doesn't exist
     pub fn init(config: Config) -> anyhow::Result<Self> {
+        let db_user: String = config
+            .get_config("db_user")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'db_user' in config"))?;
+        let db_pass: String = config
+            .get_config("db_pass")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'db_pass' in config"))?;
+        let db_host: String = config
+            .get_config("db_host")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'db_host' in config"))?;
+        let db_name: String = config
+            .get_config("db_name")?
+            .ok_or_else(|| anyhow::anyhow!("Missing 'db_name' in config"))?;
+
         // Construct MySQL connection URL from config
-        let url = format!(
-            "mysql://{}:{}@{}/{}",
-            config.get_config("db_user").unwrap(),
-            config.get_config("db_pass").unwrap(),
-            config.get_config("db_host").unwrap(),
-            config.get_config("db_name").unwrap()
-        );
+        let url = format!("mysql://{}:{}@{}/{}", db_user, db_pass, db_host, db_name);
 
         // Create a connection pool
         let pool = Pool::new(Opts::from_url(&url)?)?;
@@ -110,30 +117,40 @@ impl Database {
         Ok(prices)
     }
 
-    /// Loads purchases in the last `n_days` days. Returns a vector of tuples (amount_aud, amount_btc, price)
-    pub fn get_purchases_last(&self, n_days: i32) -> anyhow::Result<Vec<(f64, f64, f64)>> {
-        let query = r"SELECT amount_aud, amount_btc, price FROM purchases_btc
-            WHERE timestamp >= :datetime_min AND timestamp < :datetime_max
+    /// Loads purchases in the last `n_days` days up to now, as a Timeseries of (amount_aud, amount_btc, price) rows
+    pub fn get_purchases_last(&self, n_days: i32) -> anyhow::Result<Timeseries<(f64, f64, f64)>> {
+        let query = r"SELECT timestamp, amount_aud, amount_btc, price FROM purchases_btc
+            WHERE timestamp >= :datetime_min AND timestamp <= :datetime_max
             ORDER BY timestamp ASC";
 
         let datetime_min: NaiveDateTime = (Local::now() - Duration::days(n_days as i64))
             .with_time(NaiveTime::MIN)
             .unwrap()
             .naive_local();
-        let datetime_max: NaiveDateTime = (Local::now())
-            .with_time(NaiveTime::MIN)
-            .unwrap()
-            .naive_local();
+        let datetime_max: NaiveDateTime = Local::now().naive_local();
 
         let mut conn = self.pool.get_conn()?;
-        let purchases: Vec<(f64, f64, f64)> = conn.exec_map(
+        let rows: Vec<(NaiveDateTime, f64, f64, f64)> = conn.exec_map(
             query,
             params! {
                 "datetime_min" => datetime_min.to_string(),
                 "datetime_max" => datetime_max.to_string()
             },
-            |(amount_aud, amount_btc, price)| (amount_aud, amount_btc, price),
+            |(timestamp, amount_aud, amount_btc, price)| (timestamp, amount_aud, amount_btc, price),
         )?;
+
+        let columns = vec![
+            "amount_aud".to_string(),
+            "amount_btc".to_string(),
+            "price".to_string(),
+        ];
+        let mut purchases = Timeseries::new(columns);
+        for (timestamp, amount_aud, amount_btc, price) in rows {
+            purchases.data.push(TimeseriesRow {
+                timestamp,
+                value: (amount_aud, amount_btc, price),
+            });
+        }
 
         Ok(purchases)
     }

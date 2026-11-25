@@ -1,4 +1,5 @@
 use log;
+use serde::de::DeserializeOwned;
 use std::fs;
 use toml;
 
@@ -15,7 +16,24 @@ impl Config {
         Config { data }
     }
 
-    pub fn get_config(&self, key: &str) -> Option<&str> {
-        self.data.get(key).and_then(|value| value.as_str())
+    /// Returns `key` cast to `Value`, `None` if missing; errors if present with an
+    /// uncastable type. TOML integers cast to floats.
+    pub fn get_config<Value: DeserializeOwned>(&self, key: &str) -> anyhow::Result<Option<Value>> {
+        let value_toml = match self.data.get(key) {
+            Some(value_toml) => value_toml.clone(),
+            None => return Ok(None),
+        };
+        let value: Value = match value_toml.try_into() {
+            Ok(value) => value,
+            Err(e) => {
+                let message = e.to_string();
+                return Err(anyhow::anyhow!(
+                    "Invalid type for '{}' in config: {}",
+                    key,
+                    message.trim_end()
+                ));
+            }
+        };
+        Ok(Some(value))
     }
 }
