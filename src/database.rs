@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
-use chrono::{DateTime, Duration, Local, NaiveDateTime, NaiveTime, Utc};
+use chrono::{Duration, NaiveDateTime, NaiveTime, Utc};
 use mysql::prelude::*;
 use mysql::*;
 
@@ -95,17 +95,15 @@ impl Database {
             )
         };
 
-        let datetime_min: NaiveDateTime = (Local::now() - Duration::days(days as i64))
-            .with_time(NaiveTime::MIN)
-            .unwrap()
-            .naive_local();
+        // Timestamps are stored in UTC, so days run midnight to midnight UTC
+        let datetime_now: NaiveDateTime = Utc::now().naive_utc();
+        let datetime_min: NaiveDateTime = (datetime_now - Duration::days(days as i64))
+            .date()
+            .and_time(NaiveTime::MIN);
         // Closing prices stop at midnight so today's partial day is excluded; intraday prices run up to now
-        let mut datetime_max: NaiveDateTime = Local::now().naive_local();
+        let mut datetime_max: NaiveDateTime = datetime_now;
         if closing {
-            datetime_max = (Local::now())
-                .with_time(NaiveTime::MIN)
-                .unwrap()
-                .naive_local();
+            datetime_max = datetime_now.date().and_time(NaiveTime::MIN);
         }
 
         let mut conn = self.pool.get_conn()?;
@@ -121,24 +119,23 @@ impl Database {
         Ok(prices)
     }
 
-    /// Loads purchases in the last `n_days` days up to now, as a Timeseries of (amount_aud, amount_btc, price) rows
+    /// Loads purchases from `n_days` days ago onwards, as a Timeseries of (amount_aud, amount_btc, price) rows.
+    /// There is no upper bound, so rows timestamped after now are returned for the caller to reject
     pub fn get_purchases_last(&self, n_days: i32) -> anyhow::Result<Timeseries<(f64, f64, f64)>> {
         let query = r"SELECT timestamp, amount_aud, amount_btc, price FROM purchases_btc
-            WHERE timestamp >= :datetime_min AND timestamp <= :datetime_max
+            WHERE timestamp >= :datetime_min
             ORDER BY timestamp ASC";
 
-        let datetime_min: NaiveDateTime = (Local::now() - Duration::days(n_days as i64))
-            .with_time(NaiveTime::MIN)
-            .unwrap()
-            .naive_local();
-        let datetime_max: NaiveDateTime = Local::now().naive_local();
+        let datetime_now: NaiveDateTime = Utc::now().naive_utc();
+        let datetime_min: NaiveDateTime = (datetime_now - Duration::days(n_days as i64))
+            .date()
+            .and_time(NaiveTime::MIN);
 
         let mut conn = self.pool.get_conn()?;
         let rows: Vec<(NaiveDateTime, f64, f64, f64)> = conn.exec_map(
             query,
             params! {
-                "datetime_min" => datetime_min.to_string(),
-                "datetime_max" => datetime_max.to_string()
+                "datetime_min" => datetime_min.to_string()
             },
             |(timestamp, amount_aud, amount_btc, price)| (timestamp, amount_aud, amount_btc, price),
         )?;
@@ -166,7 +163,10 @@ impl Database {
         amount_btc: f64,
         price: f64,
     ) -> anyhow::Result<()> {
-        let query = r"INSERT INTO purchases_btc (amount_aud, amount_btc, price) VALUES (:amount_aud, :amount_btc, :price)";
+        // Written in UTC by the app, since the column default `CURRENT_TIMESTAMP` uses the database server's zone
+        let query = r"INSERT INTO purchases_btc (amount_aud, amount_btc, price, timestamp)
+            VALUES (:amount_aud, :amount_btc, :price, :timestamp)";
+        let timestamp: NaiveDateTime = Utc::now().naive_utc();
         let mut conn = self.pool.get_conn()?;
         conn.exec_drop(
             query,
@@ -174,6 +174,7 @@ impl Database {
                 "amount_aud" => amount_aud,
                 "amount_btc" => amount_btc,
                 "price" => price,
+                "timestamp" => timestamp.to_string(),
             },
         )?;
         Ok(())
@@ -194,11 +195,13 @@ impl Database {
             ))?;
         }
 
+        // Written in UTC by the app, since the column default `CURRENT_TIMESTAMP` uses the database server's zone
         let query = format!(
-            r"INSERT INTO price_{} (price_buy, price_sell, price_last)
-              VALUES (:price_buy, :price_sell, :price_last)",
+            r"INSERT INTO price_{} (price_buy, price_sell, price_last, timestamp)
+              VALUES (:price_buy, :price_sell, :price_last, :timestamp)",
             currency
         );
+        let timestamp: NaiveDateTime = Utc::now().naive_utc();
 
         let mut conn = self.pool.get_conn()?;
         conn.exec_drop(
@@ -207,6 +210,7 @@ impl Database {
                 "price_buy" => price_buy,
                 "price_sell" => price_sell,
                 "price_last" => price_last,
+                "timestamp" => timestamp.to_string(),
             },
         )?;
         Ok(())

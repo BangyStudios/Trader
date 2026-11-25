@@ -4,7 +4,7 @@ use crate::daemon::Daemon;
 use crate::quant::moving_average::get_timeseries_ma_trailing;
 use crate::structure::algorithm::{AlgorithmInput, AlgorithmParams};
 
-use chrono::Local;
+use chrono::Utc;
 
 impl Daemon {
     async fn get_balance_aud(&self) -> anyhow::Result<f64> {
@@ -87,7 +87,18 @@ impl Daemon {
         let prices_last = self.database.get_prices_last("btc", 365 * 8 + 3, true)?;
         let ma_4y = get_timeseries_ma_trailing(prices_last, "price_mid", 365 * 4 + 1)?;
         let prices_30d = self.database.get_prices_last("btc", 30, false)?;
+        let datetime_now = Utc::now().naive_utc();
         let mut purchases_7d = self.database.get_purchases_last(7)?;
+        // A purchase after now means the stored timestamps are not UTC; the spending caps depend on them, so refuse to buy
+        if let Some(purchase_last) = purchases_7d.latest() {
+            if purchase_last.timestamp > datetime_now {
+                return Err(anyhow::anyhow!(
+                    "Last purchase at {} is after now ({} UTC); check that 'purchases_btc' timestamps are UTC",
+                    purchase_last.timestamp,
+                    datetime_now
+                ));
+            }
+        }
         // Dry runs ignore real purchases, so each run shows what a fresh start would buy
         if !self.is_wet_run {
             purchases_7d.data.clear();
@@ -98,7 +109,7 @@ impl Daemon {
             amount_buy_min: self.amount_buy_min,
         };
         let input = AlgorithmInput {
-            datetime_now: Local::now().naive_local(),
+            datetime_now,
             balance,
             price_buy,
             price_sell,
