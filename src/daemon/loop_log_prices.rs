@@ -3,7 +3,7 @@ use crate::daemon::Daemon;
 impl Daemon {
     pub async fn loop_log_prices(&self) {
         loop {
-            match self.client_cex.get_price_coin("btc").await {
+            match self.client_cex.pull_price_coin("btc").await {
                 Ok(Some(price_info)) => {
                     let parse_price = |key: &str| -> Option<f64> {
                         price_info[key].as_str()?.parse::<f64>().ok()

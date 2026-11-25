@@ -29,11 +29,11 @@ pub struct CExOrderBuy {
 
 #[async_trait]
 pub trait CExClient: Send + Sync {
-    async fn get_prices(&self) -> Result<Value>;
-    async fn get_price_coin(&self, coin: &str) -> Result<Option<Value>>;
+    async fn pull_prices(&self) -> Result<Value>;
+    async fn pull_price_coin(&self, coin: &str) -> Result<Option<Value>>;
     async fn get_sign_body(&self, body: &str) -> String;
     /// Returns the quoted buy rate in AUD per coin
-    async fn get_quote_coin_buy(&self, coin: &str, amount: f64, amounttype: &str)
+    async fn pull_quote_coin_buy(&self, coin: &str, amount: f64, amounttype: &str)
         -> anyhow::Result<f64>;
     /// Places a buy-now order that the CEx cancels if the rate has risen too far above
     /// `rate`; errors unless the order filled
@@ -44,6 +44,9 @@ pub trait CExClient: Send + Sync {
         amounttype: &str,
         rate: f64,
     ) -> anyhow::Result<CExOrderBuy>;
-    async fn get_balance(&self) -> anyhow::Result<CExBalance>;
+    /// Places an order-book buy of `amount_coin` at up to `rate` AUD per coin, waits briefly, cancels any
+    /// unfilled rest and returns what filled, with `total` including fees. A zero `amount` means nothing filled
+    async fn push_order_buy_market(&self, coin: &str, amount_coin: f64, rate: f64) -> anyhow::Result<CExOrderBuy>;
+    async fn pull_balance(&self) -> anyhow::Result<CExBalance>;
     fn print_api_key(&self) -> Result<String>;
 }

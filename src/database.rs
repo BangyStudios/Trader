@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::new()?;
 
     // Get BTC price and log it
-    if let Some(price_info) = coinspot.get_price_coin("btc").await? {
+    if let Some(price_info) = coinspot.pull_price_coin("btc").await? {
         if let Some(price) = price_info["last"].as_f64() {
             db.log_btc_price(price)?;
             println!("Logged BTC price: {}", price);

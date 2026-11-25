@@ -8,7 +8,7 @@ use chrono::Utc;
 
 impl Daemon {
     async fn get_balance_aud(&self) -> anyhow::Result<f64> {
-        let balance = self.client_cex.get_balance().await?;
+        let balance = self.client_cex.pull_balance().await?;
         for item in balance {
             if item.currency.eq_ignore_ascii_case("aud") {
                 return Ok(item.value);
@@ -19,7 +19,7 @@ impl Daemon {
 
     /// Returns the (price_buy, price_sell) of `coin` from the CEx
     async fn get_prices_coin(&self, coin: &str) -> anyhow::Result<(f64, f64)> {
-        let price_info = match self.client_cex.get_price_coin(coin).await? {
+        let price_info = match self.client_cex.pull_price_coin(coin).await? {
             Some(price_info) => price_info,
             None => return Err(anyhow::anyhow!("Price info not found for '{}'", coin)),
         };
@@ -37,31 +37,40 @@ impl Daemon {
         Ok((price_buy, price_sell))
     }
 
-    /// Buys `amount_aud` of `coin` near the quoted rate, then records the fill in the purchases table
+    /// Buys about `amount_aud` of `coin` on the order book at up to `prop_rate_above_ask` over the ask, then records
+    /// the fill in the purchases table. An unfilled order is cancelled and records nothing, so the amount accrues
+    /// for a later timestep. Order-book buys cost a ~0.1% fee, taken from the coin received, against ~2.4% over
+    /// the ask for buy-now
     async fn run_order_buy(&self, coin: &str, amount_aud: f64) -> anyhow::Result<()> {
-        let rate = self
-            .client_cex
-            .get_quote_coin_buy(coin, amount_aud, "aud")
-            .await?;
+        let prop_rate_above_ask = 0.005;
+
+        let (price_ask, _) = self.get_prices_coin(coin).await?;
+        // CoinSpot takes 8 decimal places; round the rate up and the coin amount down so the cost never exceeds `amount_aud`
+        let rate = (price_ask * (1.0 + prop_rate_above_ask) * 100.0).ceil() / 100.0;
+        let amount_coin = (amount_aud / rate * 1e8).floor() / 1e8;
+        if amount_coin <= 0.0 {
+            return Err(anyhow::anyhow!("Buy of {:.2} AUD at {} rounds to 0 {}", amount_aud, rate, coin));
+        }
+
         let order = self
             .client_cex
-            .push_order_buy_now(coin, amount_aud, "aud", rate)
+            .push_order_buy_market(coin, amount_coin, rate)
             .await?;
         if order.amount <= 0.0 {
-            return Err(anyhow::anyhow!(
-                "Buy order returned no {}: {:?}",
-                coin,
-                order
-            ));
+            log::warn!("Buy order of {} {} at {} did not fill", amount_coin, coin, rate);
+            return Ok(());
         }
 
         let price = order.total / order.amount;
+        let prop_price_above_ask = price / price_ask - 1.0;
         log::info!(
-            "Bought {} {} for {:.2} AUD at {} (quoted {}, market {})",
+            "Bought {} {} for {:.2} AUD at {} ({:+.2}% over ask {}, limit {}, market {})",
             order.amount,
             order.coin,
             order.total,
             price,
+            100.0 * prop_price_above_ask,
+            price_ask,
             rate,
             order.market
         );

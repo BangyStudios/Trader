@@ -22,6 +22,7 @@ pub struct CoinSpot {
     client: reqwest::Client,
     config: Config,
     slippage_buy_max: f64, // Percent the fill rate may rise above the quoted rate before CoinSpot cancels the buy, in [0, 1000]
+    order_fill_wait_secs: u64, // Wait before cancelling the unfilled rest of an order-book buy
 }
 
 /// CoinSpot checks `sign` against the body as JavaScript re-serializes it, which writes whole
@@ -63,6 +64,40 @@ struct CoinSpotRequestOrderBuyNow<'a> {
 }
 
 #[derive(Deserialize)]
+struct CoinSpotResponseOrderBuy {
+    id: String,
+    coin: String,
+    market: String,
+}
+
+#[derive(Deserialize)]
+struct CoinSpotOrderOpen {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct CoinSpotResponseOrdersOpen {
+    buyorders: Vec<CoinSpotOrderOpen>,
+}
+
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct CoinSpotOrderCompleted {
+    id: String,
+    amount: f64, // Coin received
+    rate: f64,
+    total: f64, // AUD, excluding the fee
+    audfeeExGst: Option<f64>,
+    audGst: Option<f64>,
+    audtotal: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct CoinSpotResponseOrdersCompleted {
+    buyorders: Vec<CoinSpotOrderCompleted>,
+}
+
+#[derive(Deserialize)]
 struct CoinSpotResponseStatus {
     status: String,
     message: Option<String>,
@@ -71,6 +106,19 @@ struct CoinSpotResponseStatus {
 #[derive(Deserialize)]
 struct CoinSpotResponseQuote {
     rate: f64,
+}
+
+/// `value` rounded to `n_decimals` as a plain decimal without trailing zeros, which is how JavaScript writes
+/// numbers in [1e-6, 1e21). serde writes small floats in exponent form (`1.682e-5`), which fails CoinSpot's
+/// signature check
+fn format_f64_js(value: f64, n_decimals: usize) -> String {
+    let value_str = format!("{:.*}", n_decimals, value);
+    if !value_str.contains('.') {
+        return value_str;
+    }
+    let value_str = value_str.trim_end_matches('0');
+    let value_str = value_str.trim_end_matches('.');
+    value_str.to_string()
 }
 
 /// Milliseconds since the epoch; CoinSpot requires each nonce to exceed the previous one
@@ -100,7 +148,77 @@ impl CoinSpot {
             client,
             config: config.clone(),
             slippage_buy_max: 1.0,
+            order_fill_wait_secs: 3,
         })
+    }
+
+    async fn is_order_buy_open(&self, cointype: &str, id: &str) -> anyhow::Result<bool> {
+        let body = format!(r#"{{"nonce":"{}","cointype":"{}"}}"#, get_nonce(), cointype);
+        let response_body = self
+            .push_request_signed("https://www.coinspot.com.au/api/v2/ro/my/orders/market/open", &body)
+            .await?;
+        let response: CoinSpotResponseOrdersOpen = serde_json::from_str(&response_body)?;
+
+        let mut is_open = false;
+        for order in response.buyorders {
+            if order.id == id {
+                is_open = true;
+            }
+        }
+        Ok(is_open)
+    }
+
+    /// CoinSpot only lodges the cancel; it fails if the order has started filling
+    async fn push_order_buy_cancel(&self, id: &str) -> anyhow::Result<()> {
+        let body = format!(r#"{{"nonce":"{}","id":"{}"}}"#, get_nonce(), id);
+        self.push_request_signed("https://www.coinspot.com.au/api/v2/my/buy/cancel", &body)
+            .await?;
+        Ok(())
+    }
+
+    /// Sums the completed rows of buy order `id` in the last 24 hours (the endpoint's default window) into
+    /// (coin received, AUD paid). Returns (0, 0) when nothing filled.
+    /// `startdate` is left out: the docs say seconds, but the endpoint silently returns no rows unless it is in milliseconds
+    async fn pull_order_buy_fill(&self, cointype: &str, id: &str) -> anyhow::Result<(f64, f64)> {
+        let body = format!(r#"{{"nonce":"{}","cointype":"{}"}}"#, get_nonce(), cointype);
+        let response_body = self
+            .push_request_signed("https://www.coinspot.com.au/api/v2/ro/my/orders/market/completed", &body)
+            .await?;
+        let response: CoinSpotResponseOrdersCompleted = match serde_json::from_str(&response_body) {
+            Ok(response) => response,
+            Err(e) => {
+                return Err(anyhow!(
+                    "Completed orders response for buy order {} is unparseable: {}, body: {}",
+                    id,
+                    e,
+                    response_body
+                ))
+            }
+        };
+
+        let mut amount_coin = 0.0;
+        let mut total_aud = 0.0;
+        for order in response.buyorders {
+            if order.id != id {
+                continue;
+            }
+            // The fee is taken from the coin received, so `amount` is net of it. `audtotal` is the charge on CoinSpot's
+            // invoice; `total` (ordered coin amount times `rate`) can differ from it by rounding
+            let total_order_aud = order.audtotal.unwrap_or(order.total);
+            let fee_aud = order.audfeeExGst.unwrap_or(0.0) + order.audGst.unwrap_or(0.0);
+            log::info!(
+                "Buy order {} filled {} {} at {} for {} AUD (fee {} AUD in coin)",
+                id,
+                order.amount,
+                cointype,
+                order.rate,
+                total_order_aud,
+                fee_aud
+            );
+            amount_coin += order.amount;
+            total_aud += total_order_aud;
+        }
+        Ok((amount_coin, total_aud))
     }
 
     /// Signs and POSTs `body`, returning the response body; errors unless the HTTP status
@@ -156,7 +274,7 @@ impl CExClient for CoinSpot {
         ))
     }
 
-    async fn get_prices(&self) -> anyhow::Result<serde_json::Value> {
+    async fn pull_prices(&self) -> anyhow::Result<serde_json::Value> {
         let mut headers = HeaderMap::new();
         headers.insert("key", HeaderValue::from_str(&self.api_key)?);
         headers.insert("sign", HeaderValue::from_str(&self.api_secret)?);
@@ -188,8 +306,8 @@ impl CExClient for CoinSpot {
         }
     }
 
-    async fn get_price_coin(&self, coin: &str) -> anyhow::Result<Option<serde_json::Value>> {
-        let json_value = self.get_prices().await?;
+    async fn pull_price_coin(&self, coin: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let json_value = self.pull_prices().await?;
         let price_info = json_value["prices"][coin].clone();
         Ok(if price_info.is_null() {
             None
@@ -205,7 +323,7 @@ impl CExClient for CoinSpot {
         hex::encode(mac.finalize().into_bytes())
     }
 
-    async fn get_quote_coin_buy(
+    async fn pull_quote_coin_buy(
         &self,
         coin: &str,
         amount: f64,
@@ -264,7 +382,53 @@ impl CExClient for CoinSpot {
         Ok(order)
     }
 
-    async fn get_balance(&self) -> anyhow::Result<CExBalance> {
+    async fn push_order_buy_market(&self, coin: &str, amount_coin: f64, rate: f64) -> anyhow::Result<CExOrderBuy> {
+        let cointype = coin.to_uppercase();
+        let body = format!(
+            r#"{{"nonce":"{}","cointype":"{}","amount":{},"rate":{},"markettype":"AUD"}}"#,
+            get_nonce(),
+            cointype,
+            format_f64_js(amount_coin, 8),
+            format_f64_js(rate, 8)
+        );
+        let response_body = self
+            .push_request_signed("https://www.coinspot.com.au/api/v2/my/buy", &body)
+            .await?;
+        // The order is on the book by now, so keep the raw body for reconciling a parse failure
+        let order: CoinSpotResponseOrderBuy = match serde_json::from_str(&response_body) {
+            Ok(order) => order,
+            Err(e) => {
+                return Err(anyhow!(
+                    "Buy order placed but response is unparseable: {}, body: {}",
+                    e,
+                    response_body
+                ))
+            }
+        };
+        log::info!("Placed buy order {} for {} {} at {}", order.id, amount_coin, cointype, rate);
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(self.order_fill_wait_secs)).await;
+        let is_open = self.is_order_buy_open(&cointype, &order.id).await?;
+        if is_open {
+            log::warn!("Buy order {} still open after {} s, cancelling", order.id, self.order_fill_wait_secs);
+            self.push_order_buy_cancel(&order.id).await?;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let is_open = self.is_order_buy_open(&cointype, &order.id).await?;
+            if is_open {
+                return Err(anyhow!("Buy order {} is still open after cancelling; reconcile by hand", order.id));
+            }
+        }
+
+        let (amount_filled, total_filled) = self.pull_order_buy_fill(&cointype, &order.id).await?;
+        Ok(CExOrderBuy {
+            coin: order.coin,
+            market: order.market,
+            amount: amount_filled,
+            total: total_filled,
+        })
+    }
+
+    async fn pull_balance(&self) -> anyhow::Result<CExBalance> {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -366,5 +530,14 @@ mod tests {
             body,
             r#"{"nonce":"1","cointype":"BTC","amounttype":"aud","amount":1,"rate":150234.57,"threshold":1,"direction":"UP"}"#
         );
+    }
+
+    #[test]
+    fn test_format_f64_js_writes_plain_decimals() {
+        assert_eq!(format_f64_js(0.00001682, 8), "0.00001682");
+        assert_eq!(format_f64_js(1682.0 / 1e8, 8), "0.00001682");
+        assert_eq!(format_f64_js(89679.12, 8), "89679.12");
+        assert_eq!(format_f64_js(89679.0, 8), "89679");
+        assert_eq!(format_f64_js(0.1, 8), "0.1");
     }
 }
