@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::structure::common::Amount;
 use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
 use chrono::{Duration, NaiveDateTime, NaiveTime, Utc};
 use mysql::prelude::*;
@@ -9,10 +10,11 @@ use mysql::*;
 pub struct Database {
     pool: Pool,
     currencies_supported: Vec<String>,
+    currency_market: String, // Currency that all prices are in, the second half of each `price_<coin><market>` table
 }
 
 impl Database {
-    /// Creates a new Database instance and initializes the `price_btc` table if it doesn't exist
+    /// Creates a new Database instance and initializes the price and `purchases` tables if they don't exist
     pub fn init(config: Config) -> anyhow::Result<Self> {
         let db_user: String = config
             .get_config("db_user")?
@@ -33,65 +35,79 @@ impl Database {
         // Create a connection pool
         let pool = Pool::new(Opts::from_url(&url)?)?;
 
-        // Initialize table if not exists
-        let mut conn = pool.get_conn()?;
-        conn.query_drop(
-            r"CREATE TABLE IF NOT EXISTS price_btc (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                price_buy DOUBLE NOT NULL,
-                price_sell DOUBLE NOT NULL,
-                price_last DOUBLE NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )",
-        )?;
+        let currencies_supported = vec!["btc".to_string()]; // Example currencies
+        let currency_market = "aud".to_string();
+        let database = Database {
+            pool,
+            currencies_supported,
+            currency_market,
+        };
 
-        // Purchases table to track BTC purchases in AUD
+        // Initialize tables if not exists
+        let mut conn = database.pool.get_conn()?;
+        for currency in &database.currencies_supported {
+            let table_price = database.get_table_price(currency)?;
+            let query = format!(
+                r"CREATE TABLE IF NOT EXISTS {} (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    price_buy DOUBLE NOT NULL,
+                    price_sell DOUBLE NOT NULL,
+                    price_last DOUBLE NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )",
+                table_price
+            );
+            conn.query_drop(query)?;
+        }
+
+        // Purchases of any currency pair: `amount_out` of `currency_out` spent for `amount_in` of `currency_in`
         conn.query_drop(
-            r"CREATE TABLE IF NOT EXISTS purchases_btc (
+            r"CREATE TABLE IF NOT EXISTS purchases (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                amount_aud DOUBLE NOT NULL,
-                amount_btc DOUBLE NOT NULL,
+                amount_out DOUBLE NOT NULL,
+                currency_out VARCHAR(16) NOT NULL,
+                amount_in DOUBLE NOT NULL,
+                currency_in VARCHAR(16) NOT NULL,
                 price DOUBLE NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
         )?;
 
-        log::info!("Connected to database and ensured price_btc table exists.");
+        log::info!("Connected to database and ensured the price and purchases tables exist.");
+        Ok(database)
+    }
 
-        let currencies_supported = vec!["btc".to_string()]; // Example currencies
-
-        Ok(Database {
-            pool,
-            currencies_supported,
-        })
+    /// Price table of `currency` against the market currency, such as `price_btcaud`. `currency` is checked against
+    /// `currencies_supported`, since it is interpolated into SQL
+    fn get_table_price(&self, currency: &str) -> anyhow::Result<String> {
+        if !self.currencies_supported.contains(&currency.to_string()) {
+            return Err(anyhow::format_err!("Currency {} not currently supported", currency));
+        }
+        let table_price = format!("price_{}{}", currency, self.currency_market);
+        Ok(table_price)
     }
 
     pub fn get_prices_last(&self, currency: &str, days: i32, closing: bool) -> anyhow::Result<Vec<PriceRow>> {
-        if !self.currencies_supported.contains(&currency.to_string()) {
-            Err(anyhow::format_err!(
-                "Currency {} not currently supported",
-                currency
-            ))?;
-        }
+        let table_price = self.get_table_price(currency)?;
 
         let query = if closing {
             format!(
-                r"SELECT p.* FROM price_{currency} p
+                r"SELECT p.* FROM {table_price} p
                   INNER JOIN (
                       SELECT DATE(timestamp) AS day, MAX(timestamp) AS max_timestamp
-                      FROM price_{currency}
+                      FROM {table_price}
                       WHERE timestamp >= :datetime_min AND timestamp < :datetime_max
                       GROUP BY day
                   ) latest ON p.timestamp = latest.max_timestamp
                   ORDER BY p.timestamp ASC",
-                currency = currency
+                table_price = table_price
             )
         } else {
             format!(
-                r"SELECT * FROM price_{}
+                r"SELECT * FROM {}
                   WHERE timestamp >= :datetime_min AND timestamp < :datetime_max
                   ORDER BY timestamp ASC",
-                currency
+                table_price
             )
         };
 
@@ -119,11 +135,17 @@ impl Database {
         Ok(prices)
     }
 
-    /// Loads purchases from `n_days` days ago onwards, as a Timeseries of (amount_aud, amount_btc, price) rows.
-    /// There is no upper bound, so rows timestamped after now are returned for the caller to reject
-    pub fn get_purchases_last(&self, n_days: i32) -> anyhow::Result<Timeseries<(f64, f64, f64)>> {
-        let query = r"SELECT timestamp, amount_aud, amount_btc, price FROM purchases_btc
-            WHERE timestamp >= :datetime_min
+    /// Loads purchases of `currency_in` paid in `currency_out` from `n_days` days ago onwards, as a Timeseries of
+    /// (amount_out, amount_in, price) rows. There is no upper bound, so rows timestamped after now are returned for
+    /// the caller to reject
+    pub fn get_purchases_last(
+        &self,
+        currency_out: &str,
+        currency_in: &str,
+        n_days: i32,
+    ) -> anyhow::Result<Timeseries<(Amount, Amount, f64)>> {
+        let query = r"SELECT timestamp, amount_out, currency_out, amount_in, currency_in, price FROM purchases
+            WHERE timestamp >= :datetime_min AND currency_out = :currency_out AND currency_in = :currency_in
             ORDER BY timestamp ASC";
 
         let datetime_now: NaiveDateTime = Utc::now().naive_utc();
@@ -132,47 +154,55 @@ impl Database {
             .and_time(NaiveTime::MIN);
 
         let mut conn = self.pool.get_conn()?;
-        let rows: Vec<(NaiveDateTime, f64, f64, f64)> = conn.exec_map(
+        let rows: Vec<(NaiveDateTime, f64, String, f64, String, f64)> = conn.exec_map(
             query,
             params! {
-                "datetime_min" => datetime_min.to_string()
+                "datetime_min" => datetime_min.to_string(),
+                "currency_out" => currency_out.to_ascii_lowercase(),
+                "currency_in" => currency_in.to_ascii_lowercase(),
             },
-            |(timestamp, amount_aud, amount_btc, price)| (timestamp, amount_aud, amount_btc, price),
+            |(timestamp, amount_out, currency_out, amount_in, currency_in, price)| {
+                (timestamp, amount_out, currency_out, amount_in, currency_in, price)
+            },
         )?;
 
         let columns = vec![
-            "amount_aud".to_string(),
-            "amount_btc".to_string(),
+            "amount_out".to_string(),
+            "amount_in".to_string(),
             "price".to_string(),
         ];
         let mut purchases = Timeseries::new(columns);
-        for (timestamp, amount_aud, amount_btc, price) in rows {
+        for (timestamp, amount_out, currency_out, amount_in, currency_in, price) in rows {
+            let amount_out = Amount::init(&currency_out, amount_out);
+            let amount_in = Amount::init(&currency_in, amount_in);
             purchases.data.push(TimeseriesRow {
                 timestamp,
-                value: (amount_aud, amount_btc, price),
+                value: (amount_out, amount_in, price),
             });
         }
 
         Ok(purchases)
     }
 
-    /// Saves a purchase record to `purchases_btc`.
+    /// Saves a purchase record to `purchases`
     pub fn save_purchase(
         &self,
-        amount_aud: f64,
-        amount_btc: f64,
+        amount_out: &Amount,
+        amount_in: &Amount,
         price: f64,
     ) -> anyhow::Result<()> {
         // Written in UTC by the app, since the column default `CURRENT_TIMESTAMP` uses the database server's zone
-        let query = r"INSERT INTO purchases_btc (amount_aud, amount_btc, price, timestamp)
-            VALUES (:amount_aud, :amount_btc, :price, :timestamp)";
+        let query = r"INSERT INTO purchases (amount_out, currency_out, amount_in, currency_in, price, timestamp)
+            VALUES (:amount_out, :currency_out, :amount_in, :currency_in, :price, :timestamp)";
         let timestamp: NaiveDateTime = Utc::now().naive_utc();
         let mut conn = self.pool.get_conn()?;
         conn.exec_drop(
             query,
             params! {
-                "amount_aud" => amount_aud,
-                "amount_btc" => amount_btc,
+                "amount_out" => amount_out.amount,
+                "currency_out" => &amount_out.currency,
+                "amount_in" => amount_in.amount,
+                "currency_in" => &amount_in.currency,
                 "price" => price,
                 "timestamp" => timestamp.to_string(),
             },
@@ -180,7 +210,7 @@ impl Database {
         Ok(())
     }
 
-    /// Logs the current BTC price to the database
+    /// Logs the current price of `currency` to its price table
     pub fn save_price(
         &self,
         currency: &str,
@@ -188,18 +218,13 @@ impl Database {
         price_sell: f64,
         price_last: f64,
     ) -> anyhow::Result<()> {
-        if !self.currencies_supported.contains(&currency.to_string()) {
-            Err(anyhow::format_err!(
-                "Currency {} not currently supported",
-                currency
-            ))?;
-        }
+        let table_price = self.get_table_price(currency)?;
 
         // Written in UTC by the app, since the column default `CURRENT_TIMESTAMP` uses the database server's zone
         let query = format!(
-            r"INSERT INTO price_{} (price_buy, price_sell, price_last, timestamp)
+            r"INSERT INTO {} (price_buy, price_sell, price_last, timestamp)
               VALUES (:price_buy, :price_sell, :price_last, :timestamp)",
-            currency
+            table_price
         );
         let timestamp: NaiveDateTime = Utc::now().naive_utc();
 

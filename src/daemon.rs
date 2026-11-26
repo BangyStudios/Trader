@@ -4,6 +4,7 @@ mod loop_run_algorithm;
 use crate::api;
 use crate::config;
 use crate::database;
+use crate::structure::common::Amount;
 use crate::quant::moving_average::get_timeseries_diff;
 use crate::utils;
 
@@ -16,8 +17,9 @@ pub struct Daemon {
     database: database::Database,
     client_cex: Box<dyn api::CExClient>,
     timestep_mins: u32,
-    deposit_1d: f64,
-    amount_buy_min: Option<f64>,
+    currency_market: String, // Currency that the balance, deposits and orders are in
+    deposit_1d: Amount,
+    amount_buy_min: Option<Amount>,
     is_wet_run: bool, // Places real orders when true, otherwise only logs them
 }
 
@@ -38,10 +40,16 @@ impl Daemon {
 
         let timestep_mins: u32 = config.get_config("timestep_mins")?.unwrap_or(5);
 
+        let currency_market = "aud".to_string();
         let deposit_1d: f64 = config
             .get_config("deposit_1d")?
             .ok_or_else(|| anyhow::anyhow!("Missing 'deposit_1d' in config"))?;
+        let deposit_1d = Amount::init(&currency_market, deposit_1d);
         let amount_buy_min: Option<f64> = config.get_config("amount_buy_min")?;
+        let amount_buy_min = match amount_buy_min {
+            Some(amount_buy_min) => Some(Amount::init(&currency_market, amount_buy_min)),
+            None => None,
+        };
 
         // Missing means dry run, so an incomplete config never trades
         let is_wet_run: bool = config.get_config("is_wet_run")?.unwrap_or(false);
@@ -55,6 +63,7 @@ impl Daemon {
             database,
             client_cex,
             timestep_mins,
+            currency_market,
             deposit_1d,
             amount_buy_min,
             is_wet_run,

@@ -1,6 +1,7 @@
 // src/api/coinspot.rs
 use crate::api::{CExBalance, CExBalanceItem, CExClient, CExOrderBuy};
 use crate::config::Config;
+use crate::structure::common::Amount;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ pub struct CoinSpot {
     api_secret: String,
     client: reqwest::Client,
     config: Config,
+    currency_market: String, // Currency that orders are paid in
     slippage_buy_max: f64, // Percent the fill rate may rise above the quoted rate before CoinSpot cancels the buy, in [0, 1000]
     order_fill_wait_secs: u64, // Wait before cancelling the unfilled rest of an order-book buy
 }
@@ -64,6 +66,12 @@ struct CoinSpotRequestOrderBuyNow<'a> {
 }
 
 #[derive(Deserialize)]
+struct CoinSpotResponseOrderBuyNow {
+    amount: f64, // Coin received
+    total: f64,  // Paid, in the market currency
+}
+
+#[derive(Deserialize)]
 struct CoinSpotResponseOrderBuy {
     id: String,
     coin: String,
@@ -86,10 +94,9 @@ struct CoinSpotOrderCompleted {
     id: String,
     amount: f64, // Coin received
     rate: f64,
-    total: f64, // AUD, excluding the fee
+    total: f64, // Market currency, excluding the fee
     audfeeExGst: Option<f64>,
     audGst: Option<f64>,
-    audtotal: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +154,7 @@ impl CoinSpot {
             api_secret,
             client,
             config: config.clone(),
+            currency_market: "aud".to_string(),
             slippage_buy_max: 1.0,
             order_fill_wait_secs: 3,
         })
@@ -176,10 +184,26 @@ impl CoinSpot {
         Ok(())
     }
 
+    /// CoinSpot's `amounttype` for `amount`: "coin" when it is in `coin`, otherwise the market currency
+    fn get_amounttype(&self, coin: &str, amount: &Amount) -> anyhow::Result<String> {
+        if amount.currency.eq_ignore_ascii_case(coin) {
+            return Ok("coin".to_string());
+        }
+        if amount.currency == self.currency_market {
+            return Ok(self.currency_market.clone());
+        }
+        Err(anyhow!(
+            "Amount in '{}' is neither coin '{}' nor market '{}'",
+            amount.currency,
+            coin,
+            self.currency_market
+        ))
+    }
+
     /// Sums the completed rows of buy order `id` in the last 24 hours (the endpoint's default window) into
-    /// (coin received, AUD paid). Returns (0, 0) when nothing filled.
+    /// (amount_in, amount_out). Both are zero when nothing filled.
     /// `startdate` is left out: the docs say seconds, but the endpoint silently returns no rows unless it is in milliseconds
-    async fn pull_order_buy_fill(&self, cointype: &str, id: &str) -> anyhow::Result<(f64, f64)> {
+    async fn pull_order_buy_fill(&self, cointype: &str, id: &str) -> anyhow::Result<(Amount, Amount)> {
         let body = format!(r#"{{"nonce":"{}","cointype":"{}"}}"#, get_nonce(), cointype);
         let response_body = self
             .push_request_signed("https://www.coinspot.com.au/api/v2/ro/my/orders/market/completed", &body)
@@ -196,29 +220,29 @@ impl CoinSpot {
             }
         };
 
-        let mut amount_coin = 0.0;
-        let mut total_aud = 0.0;
+        let mut amount_in = Amount::init(cointype, 0.0);
+        let mut amount_out = Amount::init(&self.currency_market, 0.0);
         for order in response.buyorders {
             if order.id != id {
                 continue;
             }
-            // The fee is taken from the coin received, so `amount` is net of it. `audtotal` is the charge on CoinSpot's
-            // invoice; `total` (ordered coin amount times `rate`) can differ from it by rounding
-            let total_order_aud = order.audtotal.unwrap_or(order.total);
-            let fee_aud = order.audfeeExGst.unwrap_or(0.0) + order.audGst.unwrap_or(0.0);
+            // The fee is taken from the coin received, so `amount` is net of it. `total` (ordered coin amount times
+            // `rate`) is used over `audtotal`, which is rounded to cents and skews the price of small fills
+            let amount_order = Amount::init(cointype, order.amount);
+            let total_order = Amount::init(&self.currency_market, order.total);
+            let fee = Amount::init(&self.currency_market, order.audfeeExGst.unwrap_or(0.0) + order.audGst.unwrap_or(0.0));
             log::info!(
-                "Buy order {} filled {} {} at {} for {} AUD (fee {} AUD in coin)",
+                "Buy order {} filled {} at {} for {} (fee {} in coin)",
                 id,
-                order.amount,
-                cointype,
+                amount_order,
                 order.rate,
-                total_order_aud,
-                fee_aud
+                total_order,
+                fee
             );
-            amount_coin += order.amount;
-            total_aud += total_order_aud;
+            amount_in.amount += amount_order.amount;
+            amount_out.amount += total_order.amount;
         }
-        Ok((amount_coin, total_aud))
+        Ok((amount_in, amount_out))
     }
 
     /// Signs and POSTs `body`, returning the response body; errors unless the HTTP status
@@ -323,18 +347,14 @@ impl CExClient for CoinSpot {
         hex::encode(mac.finalize().into_bytes())
     }
 
-    async fn pull_quote_coin_buy(
-        &self,
-        coin: &str,
-        amount: f64,
-        amounttype: &str,
-    ) -> anyhow::Result<f64> {
+    async fn pull_quote_coin_buy(&self, coin: &str, amount: &Amount) -> anyhow::Result<f64> {
         let cointype = coin.to_uppercase();
+        let amounttype = self.get_amounttype(coin, amount)?;
         let request = CoinSpotRequestQuote {
             nonce: get_nonce(),
             cointype: &cointype,
-            amount,
-            amounttype,
+            amount: amount.amount,
+            amounttype: &amounttype,
         };
         let body = serde_json::to_string(&request)?;
         let response_body = self
@@ -345,19 +365,14 @@ impl CExClient for CoinSpot {
         Ok(response.rate)
     }
 
-    async fn push_order_buy_now(
-        &self,
-        coin: &str,
-        amount: f64,
-        amounttype: &str,
-        rate: f64,
-    ) -> anyhow::Result<CExOrderBuy> {
+    async fn push_order_buy_now(&self, coin: &str, amount: &Amount, rate: f64) -> anyhow::Result<CExOrderBuy> {
         let cointype = coin.to_uppercase();
+        let amounttype = self.get_amounttype(coin, amount)?;
         let request = CoinSpotRequestOrderBuyNow {
             nonce: get_nonce(),
             cointype: &cointype,
-            amounttype,
-            amount,
+            amounttype: &amounttype,
+            amount: amount.amount,
             rate,
             threshold: self.slippage_buy_max,
             direction: "UP",
@@ -368,7 +383,7 @@ impl CExClient for CoinSpot {
             .await?;
 
         // The order has filled by now, so keep the raw body for reconciling a parse failure
-        let order: CExOrderBuy = match serde_json::from_str(&response_body) {
+        let order: CoinSpotResponseOrderBuyNow = match serde_json::from_str(&response_body) {
             Ok(order) => order,
             Err(e) => {
                 log::error!(
@@ -379,17 +394,22 @@ impl CExClient for CoinSpot {
                 return Err(e.into());
             }
         };
-        Ok(order)
+        Ok(CExOrderBuy {
+            amount_in: Amount::init(coin, order.amount),
+            amount_out: Amount::init(&self.currency_market, order.total),
+        })
     }
 
-    async fn push_order_buy_market(&self, coin: &str, amount_coin: f64, rate: f64) -> anyhow::Result<CExOrderBuy> {
-        let cointype = coin.to_uppercase();
+    async fn push_order_buy_market(&self, amount: &Amount, rate: f64) -> anyhow::Result<CExOrderBuy> {
+        let cointype = amount.currency.to_uppercase();
+        let markettype = self.currency_market.to_uppercase();
         let body = format!(
-            r#"{{"nonce":"{}","cointype":"{}","amount":{},"rate":{},"markettype":"AUD"}}"#,
+            r#"{{"nonce":"{}","cointype":"{}","amount":{},"rate":{},"markettype":"{}"}}"#,
             get_nonce(),
             cointype,
-            format_f64_js(amount_coin, 8),
-            format_f64_js(rate, 8)
+            format_f64_js(amount.amount, 8),
+            format_f64_js(rate, 8),
+            markettype
         );
         let response_body = self
             .push_request_signed("https://www.coinspot.com.au/api/v2/my/buy", &body)
@@ -405,7 +425,7 @@ impl CExClient for CoinSpot {
                 ))
             }
         };
-        log::info!("Placed buy order {} for {} {} at {}", order.id, amount_coin, cointype, rate);
+        log::info!("Placed buy order {} for {} at {} (coin {}, market {})", order.id, amount, rate, order.coin, order.market);
 
         tokio::time::sleep(tokio::time::Duration::from_secs(self.order_fill_wait_secs)).await;
         let is_open = self.is_order_buy_open(&cointype, &order.id).await?;
@@ -419,13 +439,8 @@ impl CExClient for CoinSpot {
             }
         }
 
-        let (amount_filled, total_filled) = self.pull_order_buy_fill(&cointype, &order.id).await?;
-        Ok(CExOrderBuy {
-            coin: order.coin,
-            market: order.market,
-            amount: amount_filled,
-            total: total_filled,
-        })
+        let (amount_in, amount_out) = self.pull_order_buy_fill(&cointype, &order.id).await?;
+        Ok(CExOrderBuy { amount_in, amount_out })
     }
 
     async fn pull_balance(&self) -> anyhow::Result<CExBalance> {
@@ -478,14 +493,18 @@ impl CExClient for CoinSpot {
                                 .and_then(|obj| obj.iter().next())
                                 .ok_or_else(|| anyhow::Error::msg("empty balance item".to_string()))?;
 
-                            let value_fiat = data.get("audbalance").and_then(Value::as_f64)
+                            let amount_fiat = data.get("audbalance").and_then(Value::as_f64)
                                 .ok_or_else(|| anyhow::Error::msg("missing audbalance".to_string()))?;
-                            let value = data.get("balance").and_then(Value::as_f64)
+                            let amount = data.get("balance").and_then(Value::as_f64)
                                 .ok_or_else(|| anyhow::Error::msg("missing balance".to_string()))?;
                             let rate = data.get("rate").and_then(Value::as_f64)
                                 .ok_or_else(|| anyhow::Error::msg("missing rate".to_string()))?;
 
-                            Ok(CExBalanceItem{ currency: currency.to_string(), value_fiat: value_fiat, value: value, rate: rate })
+                            Ok(CExBalanceItem {
+                                amount: Amount::init(currency, amount),
+                                amount_fiat: Amount::init(&self.currency_market, amount_fiat),
+                                rate,
+                            })
                         })
                         .collect::<Result<CExBalance, anyhow::Error>>()
                     })?;

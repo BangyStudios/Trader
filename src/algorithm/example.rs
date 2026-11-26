@@ -1,5 +1,6 @@
 use crate::algorithm::Algorithm;
 use crate::structure::algorithm::{AlgorithmCommand, AlgorithmInput, AlgorithmParams};
+use crate::structure::common::Amount;
 
 use async_trait::async_trait;
 
@@ -37,9 +38,9 @@ pub struct Algorithm_Example {}
 #[async_trait]
 impl Algorithm for Algorithm_Example {
     async fn run_algorithm(&self, params: AlgorithmParams, input: AlgorithmInput) -> anyhow::Result<AlgorithmCommand> {
-        let price_buy_max = 50_000.0; // AUD
-        let price_sell_min = 150_000.0; // AUD
-        let amount_trade = 100.0; // AUD per transaction
+        let price_buy_max = 50_000.0; // Market currency per coin
+        let price_sell_min = 150_000.0; // Market currency per coin
+        let amount_trade = Amount::init(&input.balance.currency, 100.0); // Per transaction
 
         if input.price_buy < price_buy_max {
             return Ok(AlgorithmCommand { command: 1, amount: Some(amount_trade) });

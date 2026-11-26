@@ -1,4 +1,5 @@
-// Run from the project root: cargo run --bin simulator -- <n_days_last> [algorithm_name] [steps_csv_path]
+// Run from the project root:
+// cargo run --bin simulator -- <n_days_last> [algorithm_name] [steps_csv_path] [deposit_initial] [deposit_1d_simulated]
 mod algorithm;
 mod api;
 mod config;
@@ -13,6 +14,7 @@ use crate::config::Config;
 use crate::database::Database;
 use crate::quant::moving_average::get_timeseries_ma_trailing;
 use crate::structure::algorithm::{AlgorithmInput, AlgorithmParams};
+use crate::structure::common::Amount;
 use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
 
 use anyhow::anyhow;
@@ -21,34 +23,36 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
 const days_history_closing: i32 = 365 * 8 + 3; // Matches the daemon's closing-price history
 const days_history_intraday: i32 = 30; // Matches the daemon's intraday window
 const algorithm_name_default: &str = "v1_0";
+const currency_market: &str = "aud"; // Currency of the balance, deposits and prices
+const coin: &str = "btc";
 
 /// One row per simulated timestep for plotting; `pct_buy` is the v1_0 weighted percentile, `None` when
 /// the percentile cannot be computed
 struct SimulatorStep {
     timestamp: NaiveDateTime,
     pct_buy: Option<f64>,
-    amount_aud: f64,
+    amount: Amount, // Bought at this timestep, in the market currency
     price_buy: f64,
     price_sell: f64,
     price_ma: f64, // 4-year moving average of daily closes
-    deposit_aud: f64, // Deposit added at this timestep, 0 on all but the first of each day
+    deposit: Amount, // Deposit added at this timestep, 0 on all but the first of each day (and the initial deposit)
 }
 
 struct SimulatorResult {
     steps: Vec<SimulatorStep>,
     n_days_last: i64,
-    amount_deposited: f64,
-    amount_spent: f64,
-    balance: f64,
-    amount_btc: f64,
-    amount_btc_dca: f64, // Baseline that spends each deposit at the first timestep of its day
+    amount_deposited: Amount,
+    amount_spent: Amount,
+    balance: Amount,
+    amount_held: Amount, // Coin bought by the algorithm
+    amount_held_dca: Amount, // Baseline that spends each deposit at the first timestep of its day
     price_sell_final: f64,
     n_purchases: usize,
 }
 
 fn init_algorithm(algorithm_name: &str) -> anyhow::Result<Box<dyn Algorithm>> {
     match algorithm_name {
-        "v1_0" => Ok(Box::new(Algorithm_v1_0 {})),
+        "v1_0" => Ok(Box::new(Algorithm_v1_0::init())),
         _ => Err(anyhow!("Unsupported algorithm '{}'", algorithm_name)),
     }
 }
@@ -90,11 +94,11 @@ fn get_prices_30d_index(prices_intraday: &[PriceRow], index_now: usize) -> Vec<P
 }
 
 fn get_purchases_7d_datetime(
-    purchases: &Timeseries<(f64, f64, f64)>,
+    purchases: &Timeseries<(Amount, Amount, f64)>,
     datetime_now: NaiveDateTime,
-) -> Timeseries<(f64, f64, f64)> {
+) -> Timeseries<(Amount, Amount, f64)> {
     let datetime_start = datetime_now - Duration::days(7);
-    let mut purchases_7d: Timeseries<(f64, f64, f64)> = Timeseries::new(purchases.columns.clone());
+    let mut purchases_7d: Timeseries<(Amount, Amount, f64)> = Timeseries::new(purchases.columns.clone());
     for purchase_row in purchases.range(datetime_start, datetime_now) {
         purchases_7d.data.push(purchase_row.clone());
     }
@@ -116,16 +120,19 @@ fn get_pct_buy_step(
     }
 }
 
-/// Replays every intraday price row of the last `n_days_last` days as one timestep, adding `deposit_1d`
-/// to the balance on the first timestep of each day. Buys fill at `price_buy`; sells are not simulated,
-/// matching the daemon
+/// Replays every intraday price row of the last `n_days_last` days as one timestep, adding `deposit_initial`
+/// to the balance on the first timestep and `deposit_1d_simulated` on the first timestep of each day. The
+/// algorithm still receives `deposit_1d` as its spend rate reference. Buys fill at `price_buy`; sells are not
+/// simulated, matching the daemon
 async fn run_simulation(
     algorithm: &dyn Algorithm,
     prices_closing: &[PriceRow],
     prices_intraday: &[PriceRow],
     n_days_last: i64,
-    deposit_1d: f64,
-    amount_buy_min: Option<f64>,
+    deposit_1d: &Amount,
+    deposit_initial: &Amount,
+    deposit_1d_simulated: &Amount,
+    amount_buy_min: &Option<Amount>,
 ) -> anyhow::Result<SimulatorResult> {
     let price_row_last = match prices_intraday.last() {
         Some(price_row_last) => price_row_last,
@@ -133,18 +140,19 @@ async fn run_simulation(
     };
     let datetime_start = price_row_last.timestamp - Duration::days(n_days_last);
 
-    let mut balance = 0.0;
-    let mut amount_btc = 0.0;
-    let mut amount_btc_dca = 0.0;
-    let mut amount_deposited = 0.0;
-    let mut amount_spent = 0.0;
-    let mut purchases: Timeseries<(f64, f64, f64)> = Timeseries::new(vec![
-        "amount_aud".to_string(),
-        "amount_btc".to_string(),
+    let mut balance = Amount::init(currency_market, 0.0);
+    let mut amount_held = Amount::init(coin, 0.0);
+    let mut amount_held_dca = Amount::init(coin, 0.0);
+    let mut amount_deposited = Amount::init(currency_market, 0.0);
+    let mut amount_spent = Amount::init(currency_market, 0.0);
+    let mut purchases: Timeseries<(Amount, Amount, f64)> = Timeseries::new(vec![
+        "amount_out".to_string(),
+        "amount_in".to_string(),
         "price".to_string(),
     ]);
     let mut steps: Vec<SimulatorStep> = Vec::new();
     let mut date_deposit_last: Option<NaiveDate> = None;
+    let mut is_deposited_initial = false;
     let mut date_ma_4y: Option<NaiveDate> = None;
     let mut ma_4y: Option<Timeseries<(f64, f64, f64)>> = None;
 
@@ -156,13 +164,19 @@ async fn run_simulation(
         }
         let date_now = datetime_now.date();
 
-        let mut deposit_aud = 0.0;
+        let mut deposit = Amount::init(currency_market, 0.0);
+        if !is_deposited_initial {
+            deposit.amount += deposit_initial.amount;
+            is_deposited_initial = true;
+        }
         if date_deposit_last != Some(date_now) {
-            deposit_aud = deposit_1d;
-            balance += deposit_1d;
-            amount_deposited += deposit_1d;
-            amount_btc_dca += deposit_1d / price_row.price_buy;
+            deposit.amount += deposit_1d_simulated.amount;
             date_deposit_last = Some(date_now);
+        }
+        if deposit.amount > 0.0 {
+            balance.amount += deposit.amount;
+            amount_deposited.amount += deposit.amount;
+            amount_held_dca.amount += deposit.amount / price_row.price_buy;
         }
 
         // Closes only change at midnight, so the moving averages are rebuilt once per day
@@ -188,17 +202,20 @@ async fn run_simulation(
         steps.push(SimulatorStep {
             timestamp: datetime_now,
             pct_buy,
-            amount_aud: 0.0,
+            amount: Amount::init(currency_market, 0.0),
             price_buy: price_row.price_buy,
             price_sell: price_row.price_sell,
             price_ma,
-            deposit_aud,
+            deposit,
         });
 
-        let params = AlgorithmParams { deposit_1d, amount_buy_min };
+        let params = AlgorithmParams {
+            deposit_1d: deposit_1d.clone(),
+            amount_buy_min: amount_buy_min.clone(),
+        };
         let input = AlgorithmInput {
             datetime_now,
-            balance,
+            balance: balance.clone(),
             price_buy: price_row.price_buy,
             price_sell: price_row.price_sell,
             ma_4y: ma_4y_now,
@@ -218,24 +235,28 @@ async fn run_simulation(
         };
 
         // Same 2 decimal floor as the daemon, so the order never overspends
-        let amount_aud = (amount * 100.0).floor() / 100.0;
-        if amount_aud <= 0.0 {
+        let amount = Amount::init(&amount.currency, (amount.amount * 100.0).floor() / 100.0);
+        if amount.amount <= 0.0 {
             continue;
         }
-        if amount_aud > balance {
-            log::warn!("Buy of {:.2} AUD exceeds balance {:.2} AUD at {}", amount_aud, balance, datetime_now);
+        if amount.currency != balance.currency {
+            log::warn!("Buy of {} is not in the balance currency at {}", amount, datetime_now);
+            continue;
+        }
+        if amount.amount > balance.amount {
+            log::warn!("Buy of {:.2} exceeds balance {:.2} at {}", amount, balance, datetime_now);
             continue;
         }
 
-        let amount_btc_bought = amount_aud / price_row.price_buy;
-        balance -= amount_aud;
-        amount_btc += amount_btc_bought;
-        amount_spent += amount_aud;
+        let amount_in = Amount::init(coin, amount.amount / price_row.price_buy);
+        balance.amount -= amount.amount;
+        amount_held.amount += amount_in.amount;
+        amount_spent.amount += amount.amount;
         let step_last = steps.last_mut().expect("A step is pushed before every buy");
-        step_last.amount_aud = amount_aud;
+        step_last.amount = amount.clone();
         purchases.data.push(TimeseriesRow {
             timestamp: datetime_now,
-            value: (amount_aud, amount_btc_bought, price_row.price_buy),
+            value: (amount, amount_in, price_row.price_buy),
         });
     }
 
@@ -245,14 +266,15 @@ async fn run_simulation(
         amount_deposited,
         amount_spent,
         balance,
-        amount_btc,
-        amount_btc_dca,
+        amount_held,
+        amount_held_dca,
         price_sell_final: price_row_last.price_sell,
         n_purchases: purchases.len(),
     })
 }
 
-/// Writes timestamp, pct_buy (blank when `None`) and amount_aud per timestep
+/// Writes timestamp, pct_buy (blank when `None`) and the amount bought per timestep. The `amount_aud` and
+/// `deposit_aud` headers are kept for existing plots
 fn save_simulator_steps(steps: &[SimulatorStep], path_csv: &str) -> anyhow::Result<()> {
     let mut lines: Vec<String> = vec!["timestamp,pct_buy,amount_aud,price_buy,price_sell,price_ma,deposit_aud".to_string()];
     for step in steps {
@@ -262,7 +284,7 @@ fn save_simulator_steps(steps: &[SimulatorStep], path_csv: &str) -> anyhow::Resu
         };
         lines.push(format!(
             "{},{},{},{},{},{},{}",
-            step.timestamp, pct_buy_str, step.amount_aud, step.price_buy, step.price_sell, step.price_ma, step.deposit_aud
+            step.timestamp, pct_buy_str, step.amount.amount, step.price_buy, step.price_sell, step.price_ma, step.deposit.amount
         ));
     }
     std::fs::write(path_csv, lines.join("\n"))?;
@@ -270,29 +292,32 @@ fn save_simulator_steps(steps: &[SimulatorStep], path_csv: &str) -> anyhow::Resu
 }
 
 fn log_simulator_result(result: &SimulatorResult) -> () {
-    let value_btc = result.amount_btc * result.price_sell_final;
-    let value_total = result.balance + value_btc;
-    let profit = value_total - result.amount_deposited;
+    let currency = &result.balance.currency;
+    let value_held = Amount::init(currency, result.amount_held.amount * result.price_sell_final);
+    let value_total = Amount::init(currency, result.balance.amount + value_held.amount);
+    let profit = Amount::init(currency, value_total.amount - result.amount_deposited.amount);
 
     let mut profit_pct = 0.0;
-    if result.amount_deposited > 0.0 {
-        profit_pct = 100.0 * profit / result.amount_deposited;
+    if result.amount_deposited.amount > 0.0 {
+        profit_pct = 100.0 * profit.amount / result.amount_deposited.amount;
     }
-    let mut price_average = 0.0;
-    if result.amount_btc > 0.0 {
-        price_average = result.amount_spent / result.amount_btc;
+    let mut price_average = Amount::init(currency, 0.0);
+    if result.amount_held.amount > 0.0 {
+        price_average.amount = result.amount_spent.amount / result.amount_held.amount;
     }
+    let price_sell_final = Amount::init(currency, result.price_sell_final);
 
     log::info!("Simulation over the last {} day(s)", result.n_days_last);
-    log::info!("Deposited {:.2} AUD, spent {:.2} AUD in {} purchase(s)", result.amount_deposited, result.amount_spent, result.n_purchases);
-    log::info!("Holding {:.8} BTC at an average {:.2} AUD, final sell price {:.2} AUD", result.amount_btc, price_average, result.price_sell_final);
-    let value_dca = result.amount_btc_dca * result.price_sell_final;
-    let mut price_average_dca = 0.0;
-    if result.amount_btc_dca > 0.0 {
-        price_average_dca = result.amount_deposited / result.amount_btc_dca;
+    log::info!("Deposited {:.2}, spent {:.2} in {} purchase(s)", result.amount_deposited, result.amount_spent, result.n_purchases);
+    log::info!("Holding {:.8} at an average {:.2}, final sell price {:.2}", result.amount_held, price_average, price_sell_final);
+    let value_dca = Amount::init(currency, result.amount_held_dca.amount * result.price_sell_final);
+    let mut price_average_dca = Amount::init(currency, 0.0);
+    if result.amount_held_dca.amount > 0.0 {
+        price_average_dca.amount = result.amount_deposited.amount / result.amount_held_dca.amount;
     }
-    log::info!("DCA baseline: {:.8} BTC at an average {:.2} AUD, final value {:.2} AUD, algorithm minus DCA {:.2} AUD", result.amount_btc_dca, price_average_dca, value_dca, value_total - value_dca);
-    log::info!("Final value {:.2} AUD (balance {:.2} + BTC {:.2}), profit {:.2} AUD ({:.2}%)", value_total, result.balance, value_btc, profit, profit_pct);
+    let value_vs_dca = Amount::init(currency, value_total.amount - value_dca.amount);
+    log::info!("DCA baseline: {:.8} at an average {:.2}, final value {:.2}, algorithm minus DCA {:.2}", result.amount_held_dca, price_average_dca, value_dca, value_vs_dca);
+    log::info!("Final value {:.2} (balance {:.2} + held {:.2}), profit {:.2} ({:.2}%)", value_total, result.balance, value_held, profit, profit_pct);
 }
 
 async fn run_simulator() -> anyhow::Result<()> {
@@ -322,12 +347,32 @@ async fn run_simulator() -> anyhow::Result<()> {
         .get_config("deposit_1d")?
         .ok_or_else(|| anyhow!("Missing 'deposit_1d' in config"))?;
     let amount_buy_min: Option<f64> = config.get_config("amount_buy_min")?;
+    let amount_buy_min = match amount_buy_min {
+        Some(amount_buy_min) => Some(Amount::init(currency_market, amount_buy_min)),
+        None => None,
+    };
+
+    let deposit_initial: f64 = match args.get(4) {
+        Some(deposit_initial_str) => deposit_initial_str
+            .parse()
+            .map_err(|e| anyhow!("Invalid deposit_initial '{}': {}", deposit_initial_str, e))?,
+        None => 0.0,
+    };
+    let deposit_1d_simulated: f64 = match args.get(5) {
+        Some(deposit_1d_simulated_str) => deposit_1d_simulated_str
+            .parse()
+            .map_err(|e| anyhow!("Invalid deposit_1d_simulated '{}': {}", deposit_1d_simulated_str, e))?,
+        None => deposit_1d,
+    };
+    let deposit_1d = Amount::init(currency_market, deposit_1d);
+    let deposit_initial = Amount::init(currency_market, deposit_initial);
+    let deposit_1d_simulated = Amount::init(currency_market, deposit_1d_simulated);
 
     let database = Database::init(config.clone())?;
     let days_closing = n_days_last as i32 + days_history_closing;
     let days_intraday = n_days_last as i32 + days_history_intraday;
-    let prices_closing = database.get_prices_last("btc", days_closing, true)?;
-    let prices_intraday = database.get_prices_last("btc", days_intraday, false)?;
+    let prices_closing = database.get_prices_last(coin, days_closing, true)?;
+    let prices_intraday = database.get_prices_last(coin, days_intraday, false)?;
     log::info!(
         "Loaded {} closing and {} intraday price rows, running '{}'",
         prices_closing.len(),
@@ -340,8 +385,10 @@ async fn run_simulator() -> anyhow::Result<()> {
         &prices_closing,
         &prices_intraday,
         n_days_last,
-        deposit_1d,
-        amount_buy_min,
+        &deposit_1d,
+        &deposit_initial,
+        &deposit_1d_simulated,
+        &amount_buy_min,
     )
     .await?;
     log_simulator_result(&result);
