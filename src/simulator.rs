@@ -1,5 +1,6 @@
 // Run from the project root:
-// cargo run --bin simulator -- <n_days_last> [algorithm_name] [steps_csv_path] [deposit_initial] [deposit_1d_simulated]
+// cargo run --bin simulator -- <n_days_last> [algorithm_name] [steps_csv_path] [deposit_initial] [deposit_1d_simulated] [balance_reserve]
+// cargo run --release --bin simulator -- sweep <grid_toml_path> <results_csv_path>
 mod algorithm;
 mod api;
 mod config;
@@ -8,7 +9,7 @@ mod quant;
 mod structure;
 mod utils;
 
-use crate::algorithm::v1_0::{get_pct_buy_datetime, Algorithm_v1_0};
+use crate::algorithm::v1_0::{get_pct_buy_datetime, Algorithm_v1_0, Hyperparameters_v1_0};
 use crate::algorithm::Algorithm;
 use crate::config::Config;
 use crate::database::Database;
@@ -18,7 +19,9 @@ use crate::structure::common::Amount;
 use crate::structure::timeseries::{PriceRow, Timeseries, TimeseriesRow};
 
 use anyhow::anyhow;
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use serde::Deserialize;
+use std::collections::HashMap;
 
 const days_history_closing: i32 = 365 * 8 + 3; // Matches the daemon's closing-price history
 const days_history_intraday: i32 = 30; // Matches the daemon's intraday window
@@ -27,7 +30,7 @@ const currency_market: &str = "aud"; // Currency of the balance, deposits and pr
 const coin: &str = "btc";
 
 /// One row per simulated timestep for plotting; `pct_buy` is the v1_0 weighted percentile, `None` when
-/// the percentile cannot be computed
+/// the percentile cannot be computed or is not saved
 struct SimulatorStep {
     timestamp: NaiveDateTime,
     pct_buy: Option<f64>,
@@ -40,19 +43,70 @@ struct SimulatorStep {
 
 struct SimulatorResult {
     steps: Vec<SimulatorStep>,
-    n_days_last: i64,
+    datetime_start: NaiveDateTime,
+    datetime_end: NaiveDateTime,
     amount_deposited: Amount,
     amount_spent: Amount,
+    amount_spent_first_half: Amount, // Spent from 00:00 to 12:00 UTC, the first half of each deposit's day
     balance: Amount,
+    balance_reserve: Amount,
     amount_held: Amount, // Coin bought by the algorithm
     amount_held_dca: Amount, // Baseline that spends each deposit at the first timestep of its day
     price_sell_final: f64,
+    price_buy_mean: f64, // Mean over the timesteps, the price an evenly spread buyer pays
     n_purchases: usize,
+    n_steps_below_reserve: usize, // Timesteps ending with the balance below `balance_reserve`
+}
+
+/// Returns on the amount deposited, with the final balance valued as cash
+struct SimulatorMetrics {
+    roi: f64,
+    roi_dca: f64,
+    // As `roi`, but valuing the final balance as if bought at `price_buy_mean`, so cash held at the end neither
+    // gains nor loses from the final price
+    roi_neutral: f64,
+    prop_steps_below_reserve: f64,
+    prop_spent_first_half: f64,
+}
+
+/// Price history shared by every run: intraday rows and the 4-year moving averages known on each date
+struct SimulatorPrices {
+    prices_intraday: Vec<PriceRow>,
+    ma_4y_by_date: HashMap<NaiveDate, Timeseries<(f64, f64, f64)>>, // Missing on dates without enough closes
+}
+
+/// Ranges of v1_0 hyperparameters and reserves to backtest over sliding windows. Every combination runs on every window
+#[derive(Deserialize)]
+struct SweepGrid {
+    deposit_1d: f64,
+    amount_buy_min: Option<f64>,
+    n_days_last: i64, // Windows tile the last `n_days_last` days
+    n_days_window: i64,
+    n_days_window_step: i64,
+    balance_reserve: Vec<f64>,
+    multiplier_max: Vec<f64>,
+    pct_neutral: Vec<f64>,
+    prop_balance_1d_max: Vec<f64>,
+    prop_budget_step_max: Vec<f64>,
+    pct_reserve_unlock: Vec<f64>,
+    days_runway: Vec<f64>,
+}
+
+#[derive(Clone)]
+struct SweepCase {
+    balance_reserve: f64,
+    hyperparameters: Hyperparameters_v1_0,
+}
+
+struct SweepJob {
+    index_case: usize,
+    datetime_start: NaiveDateTime,
+    datetime_end: NaiveDateTime,
 }
 
 fn init_algorithm(algorithm_name: &str) -> anyhow::Result<Box<dyn Algorithm>> {
     match algorithm_name {
-        "v1_0" => Ok(Box::new(Algorithm_v1_0::init())),
+        "v1_0" => Ok(Box::new(Algorithm_v1_0::init(Hyperparameters_v1_0::default()))),
         _ => Err(anyhow!("Unsupported algorithm '{}'", algorithm_name)),
     }
 }
@@ -76,6 +130,26 @@ fn get_ma_4y_datetime(
     Ok(ma_4y)
 }
 
+impl SimulatorPrices {
+    /// Builds the moving averages once per date from `datetime_start` on, since closes only change at midnight
+    fn init(prices_closing: &[PriceRow], prices_intraday: Vec<PriceRow>, datetime_start: NaiveDateTime) -> Self {
+        let mut ma_4y_by_date: HashMap<NaiveDate, Timeseries<(f64, f64, f64)>> = HashMap::new();
+        for price_row in &prices_intraday {
+            let date = price_row.timestamp.date();
+            if price_row.timestamp < datetime_start || ma_4y_by_date.contains_key(&date) {
+                continue;
+            }
+            match get_ma_4y_datetime(prices_closing, price_row.timestamp) {
+                Ok(ma_4y) => {
+                    ma_4y_by_date.insert(date, ma_4y);
+                }
+                Err(e) => log::warn!("Skipping {}: {}", date, e),
+            }
+        }
+        SimulatorPrices { prices_intraday, ma_4y_by_date }
+    }
+}
+
 /// Intraday rows in the last 30 days up to and including `prices_intraday[index_now]`
 fn get_prices_30d_index(prices_intraday: &[PriceRow], index_now: usize) -> Vec<PriceRow> {
     let datetime_now = prices_intraday[index_now].timestamp;
@@ -93,15 +167,23 @@ fn get_prices_30d_index(prices_intraday: &[PriceRow], index_now: usize) -> Vec<P
     prices_30d
 }
 
+/// Purchases are appended in time order, so the scan stops at the first one older than 7 days
 fn get_purchases_7d_datetime(
     purchases: &Timeseries<(Amount, Amount, f64)>,
     datetime_now: NaiveDateTime,
 ) -> Timeseries<(Amount, Amount, f64)> {
     let datetime_start = datetime_now - Duration::days(7);
     let mut purchases_7d: Timeseries<(Amount, Amount, f64)> = Timeseries::new(purchases.columns.clone());
-    for purchase_row in purchases.range(datetime_start, datetime_now) {
+    for purchase_row in purchases.data.iter().rev() {
+        if purchase_row.timestamp < datetime_start {
+            break;
+        }
+        if purchase_row.timestamp > datetime_now {
+            continue;
+        }
         purchases_7d.data.push(purchase_row.clone());
     }
+    purchases_7d.data.reverse();
     purchases_7d
 }
 
@@ -120,31 +202,28 @@ fn get_pct_buy_step(
     }
 }
 
-/// Replays every intraday price row of the last `n_days_last` days as one timestep, adding `deposit_initial`
-/// to the balance on the first timestep and `deposit_1d_simulated` on the first timestep of each day. The
-/// algorithm still receives `deposit_1d` as its spend rate reference. Buys fill at `price_buy`; sells are not
-/// simulated, matching the daemon
+/// Replays every intraday price row from `datetime_start` to `datetime_end` as one timestep, adding
+/// `deposit_initial` to the balance on the first timestep and `deposit_1d_simulated` on the first timestep of each
+/// day. The algorithm still receives `params.deposit_1d` as its spend rate reference. Buys fill at `price_buy`;
+/// sells are not simulated, matching the daemon. `pct_buy` is only computed for the steps when `is_pct_buy_saved`
 async fn run_simulation(
     algorithm: &dyn Algorithm,
-    prices_closing: &[PriceRow],
-    prices_intraday: &[PriceRow],
-    n_days_last: i64,
-    deposit_1d: &Amount,
+    prices: &SimulatorPrices,
+    datetime_start: NaiveDateTime,
+    datetime_end: NaiveDateTime,
+    params: &AlgorithmParams,
     deposit_initial: &Amount,
     deposit_1d_simulated: &Amount,
-    amount_buy_min: &Option<Amount>,
+    is_pct_buy_saved: bool,
 ) -> anyhow::Result<SimulatorResult> {
-    let price_row_last = match prices_intraday.last() {
-        Some(price_row_last) => price_row_last,
-        None => return Err(anyhow!("No intraday prices in the database")),
-    };
-    let datetime_start = price_row_last.timestamp - Duration::days(n_days_last);
+    let prices_intraday = &prices.prices_intraday;
 
     let mut balance = Amount::init(currency_market, 0.0);
     let mut amount_held = Amount::init(coin, 0.0);
     let mut amount_held_dca = Amount::init(coin, 0.0);
     let mut amount_deposited = Amount::init(currency_market, 0.0);
     let mut amount_spent = Amount::init(currency_market, 0.0);
+    let mut amount_spent_first_half = Amount::init(currency_market, 0.0);
     let mut purchases: Timeseries<(Amount, Amount, f64)> = Timeseries::new(vec![
         "amount_out".to_string(),
         "amount_in".to_string(),
@@ -153,14 +232,18 @@ async fn run_simulation(
     let mut steps: Vec<SimulatorStep> = Vec::new();
     let mut date_deposit_last: Option<NaiveDate> = None;
     let mut is_deposited_initial = false;
-    let mut date_ma_4y: Option<NaiveDate> = None;
-    let mut ma_4y: Option<Timeseries<(f64, f64, f64)>> = None;
+    let mut price_row_last: Option<&PriceRow> = None;
+    let mut price_buy_sum = 0.0;
+    let mut n_steps_below_reserve: usize = 0;
 
     for index_now in 0..prices_intraday.len() {
         let price_row = &prices_intraday[index_now];
         let datetime_now = price_row.timestamp;
         if datetime_now < datetime_start {
             continue;
+        }
+        if datetime_now > datetime_end {
+            break;
         }
         let date_now = datetime_now.date();
 
@@ -179,24 +262,18 @@ async fn run_simulation(
             amount_held_dca.amount += deposit.amount / price_row.price_buy;
         }
 
-        // Closes only change at midnight, so the moving averages are rebuilt once per day
-        if date_ma_4y != Some(date_now) {
-            date_ma_4y = Some(date_now);
-            ma_4y = match get_ma_4y_datetime(prices_closing, datetime_now) {
-                Ok(ma_4y_now) => Some(ma_4y_now),
-                Err(e) => {
-                    log::warn!("Skipping {}: {}", date_now, e);
-                    None
-                }
-            };
-        }
-        let ma_4y_now = match &ma_4y {
+        let ma_4y_now = match prices.ma_4y_by_date.get(&date_now) {
             Some(ma_4y_now) => ma_4y_now.clone(),
             None => continue,
         };
+        price_row_last = Some(price_row);
+        price_buy_sum += price_row.price_buy;
 
         let prices_30d = get_prices_30d_index(prices_intraday, index_now);
-        let pct_buy = get_pct_buy_step(&ma_4y_now, &prices_30d, price_row);
+        let mut pct_buy: Option<f64> = None;
+        if is_pct_buy_saved {
+            pct_buy = get_pct_buy_step(&ma_4y_now, &prices_30d, price_row);
+        }
         let ma_4y_latest = ma_4y_now.latest().expect("get_ma_4y_datetime returns at least one row");
         let price_ma = ma_4y_latest.value.0;
         steps.push(SimulatorStep {
@@ -209,9 +286,10 @@ async fn run_simulation(
             deposit,
         });
 
-        let params = AlgorithmParams {
-            deposit_1d: deposit_1d.clone(),
-            amount_buy_min: amount_buy_min.clone(),
+        let params_now = AlgorithmParams {
+            deposit_1d: params.deposit_1d.clone(),
+            amount_buy_min: params.amount_buy_min.clone(),
+            balance_reserve: params.balance_reserve.clone(),
         };
         let input = AlgorithmInput {
             datetime_now,
@@ -222,55 +300,100 @@ async fn run_simulation(
             prices_30d,
             purchases_7d: get_purchases_7d_datetime(&purchases, datetime_now),
         };
-        let command = match algorithm.run_algorithm(params, input).await {
-            Ok(command) => command,
+        let command = match algorithm.run_algorithm(params_now, input).await {
+            Ok(command) => Some(command),
             Err(e) => {
                 log::warn!("Algorithm error at {}: {}", datetime_now, e);
-                continue;
+                None
             }
         };
-        let amount = match (command.command, command.amount) {
-            (1, Some(amount)) => amount,
-            _ => continue,
+        let amount = match command {
+            Some(command) => match (command.command, command.amount) {
+                (1, Some(amount)) => Some(amount),
+                _ => None,
+            },
+            None => None,
         };
 
         // Same 2 decimal floor as the daemon, so the order never overspends
-        let amount = Amount::init(&amount.currency, (amount.amount * 100.0).floor() / 100.0);
-        if amount.amount <= 0.0 {
-            continue;
-        }
-        if amount.currency != balance.currency {
+        let amount = match amount {
+            Some(amount) => Amount::init(&amount.currency, (amount.amount * 100.0).floor() / 100.0),
+            None => Amount::init(currency_market, 0.0),
+        };
+        let mut is_bought = amount.amount > 0.0;
+        if is_bought && amount.currency != balance.currency {
             log::warn!("Buy of {} is not in the balance currency at {}", amount, datetime_now);
-            continue;
+            is_bought = false;
         }
-        if amount.amount > balance.amount {
+        if is_bought && amount.amount > balance.amount {
             log::warn!("Buy of {:.2} exceeds balance {:.2} at {}", amount, balance, datetime_now);
-            continue;
+            is_bought = false;
         }
 
-        let amount_in = Amount::init(coin, amount.amount / price_row.price_buy);
-        balance.amount -= amount.amount;
-        amount_held.amount += amount_in.amount;
-        amount_spent.amount += amount.amount;
-        let step_last = steps.last_mut().expect("A step is pushed before every buy");
-        step_last.amount = amount.clone();
-        purchases.data.push(TimeseriesRow {
-            timestamp: datetime_now,
-            value: (amount, amount_in, price_row.price_buy),
-        });
+        if is_bought {
+            let amount_in = Amount::init(coin, amount.amount / price_row.price_buy);
+            balance.amount -= amount.amount;
+            amount_held.amount += amount_in.amount;
+            amount_spent.amount += amount.amount;
+            if datetime_now.hour() < 12 {
+                amount_spent_first_half.amount += amount.amount;
+            }
+            let step_last = steps.last_mut().expect("A step is pushed before every buy");
+            step_last.amount = amount.clone();
+            purchases.data.push(TimeseriesRow {
+                timestamp: datetime_now,
+                value: (amount, amount_in, price_row.price_buy),
+            });
+        }
+        if balance.amount < params.balance_reserve.amount {
+            n_steps_below_reserve += 1;
+        }
     }
+
+    let price_row_last = match price_row_last {
+        Some(price_row_last) => price_row_last,
+        None => return Err(anyhow!("No intraday prices from {} to {}", datetime_start, datetime_end)),
+    };
+    let price_buy_mean = price_buy_sum / steps.len() as f64;
 
     Ok(SimulatorResult {
         steps,
-        n_days_last,
+        datetime_start,
+        datetime_end,
         amount_deposited,
         amount_spent,
+        amount_spent_first_half,
         balance,
+        balance_reserve: params.balance_reserve.clone(),
         amount_held,
         amount_held_dca,
         price_sell_final: price_row_last.price_sell,
+        price_buy_mean,
         n_purchases: purchases.len(),
+        n_steps_below_reserve,
     })
+}
+
+fn get_simulator_metrics(result: &SimulatorResult) -> SimulatorMetrics {
+    let deposited = result.amount_deposited.amount;
+    let value_total = result.balance.amount + result.amount_held.amount * result.price_sell_final;
+    let value_dca = result.amount_held_dca.amount * result.price_sell_final;
+    let amount_held_neutral = result.amount_held.amount + result.balance.amount / result.price_buy_mean;
+    let value_neutral = amount_held_neutral * result.price_sell_final;
+
+    let mut prop_spent_first_half = 0.0;
+    if result.amount_spent.amount > 0.0 {
+        prop_spent_first_half = result.amount_spent_first_half.amount / result.amount_spent.amount;
+    }
+    let prop_steps_below_reserve = result.n_steps_below_reserve as f64 / result.steps.len() as f64;
+
+    SimulatorMetrics {
+        roi: value_total / deposited - 1.0,
+        roi_dca: value_dca / deposited - 1.0,
+        roi_neutral: value_neutral / deposited - 1.0,
+        prop_steps_below_reserve,
+        prop_spent_first_half,
+    }
 }
 
 /// Writes timestamp, pct_buy (blank when `None`) and the amount bought per timestep. The `amount_aud` and
@@ -293,21 +416,18 @@ fn save_simulator_steps(steps: &[SimulatorStep], path_csv: &str) -> anyhow::Resu
 
 fn log_simulator_result(result: &SimulatorResult) -> () {
     let currency = &result.balance.currency;
+    let metrics = get_simulator_metrics(result);
     let value_held = Amount::init(currency, result.amount_held.amount * result.price_sell_final);
     let value_total = Amount::init(currency, result.balance.amount + value_held.amount);
     let profit = Amount::init(currency, value_total.amount - result.amount_deposited.amount);
 
-    let mut profit_pct = 0.0;
-    if result.amount_deposited.amount > 0.0 {
-        profit_pct = 100.0 * profit.amount / result.amount_deposited.amount;
-    }
     let mut price_average = Amount::init(currency, 0.0);
     if result.amount_held.amount > 0.0 {
         price_average.amount = result.amount_spent.amount / result.amount_held.amount;
     }
     let price_sell_final = Amount::init(currency, result.price_sell_final);
 
-    log::info!("Simulation over the last {} day(s)", result.n_days_last);
+    log::info!("Simulation from {} to {}", result.datetime_start, result.datetime_end);
     log::info!("Deposited {:.2}, spent {:.2} in {} purchase(s)", result.amount_deposited, result.amount_spent, result.n_purchases);
     log::info!("Holding {:.8} at an average {:.2}, final sell price {:.2}", result.amount_held, price_average, price_sell_final);
     let value_dca = Amount::init(currency, result.amount_held_dca.amount * result.price_sell_final);
@@ -317,12 +437,239 @@ fn log_simulator_result(result: &SimulatorResult) -> () {
     }
     let value_vs_dca = Amount::init(currency, value_total.amount - value_dca.amount);
     log::info!("DCA baseline: {:.8} at an average {:.2}, final value {:.2}, algorithm minus DCA {:.2}", result.amount_held_dca, price_average_dca, value_dca, value_vs_dca);
-    log::info!("Final value {:.2} (balance {:.2} + held {:.2}), profit {:.2} ({:.2}%)", value_total, result.balance, value_held, profit, profit_pct);
+    log::info!(
+        "Spent {:.1}% in the first half of each UTC day; balance below the {:.2} reserve for {:.1}% of timesteps",
+        100.0 * metrics.prop_spent_first_half,
+        result.balance_reserve,
+        100.0 * metrics.prop_steps_below_reserve
+    );
+    log::info!(
+        "Final value {:.2} (balance {:.2} + held {:.2}), profit {:.2} ({:.2}%, {:.2}% with the balance bought at the mean price)",
+        value_total,
+        result.balance,
+        value_held,
+        profit,
+        100.0 * metrics.roi,
+        100.0 * metrics.roi_neutral
+    );
+}
+
+/// Every combination of the grid's values, each starting from the v1_0 defaults
+fn get_sweep_cases_product<Value>(
+    cases: Vec<SweepCase>,
+    values: &[Value],
+    set_value: impl Fn(&mut SweepCase, &Value),
+) -> Vec<SweepCase> {
+    let mut cases_product: Vec<SweepCase> = Vec::new();
+    for case in &cases {
+        for value in values {
+            let mut case_product = case.clone();
+            set_value(&mut case_product, value);
+            cases_product.push(case_product);
+        }
+    }
+    cases_product
+}
+
+fn get_sweep_cases(grid: &SweepGrid) -> Vec<SweepCase> {
+    let case_default = SweepCase { balance_reserve: 0.0, hyperparameters: Hyperparameters_v1_0::default() };
+    let mut cases: Vec<SweepCase> = vec![case_default];
+    cases = get_sweep_cases_product(cases, &grid.balance_reserve, |case, value| case.balance_reserve = *value);
+    cases = get_sweep_cases_product(cases, &grid.multiplier_max, |case, value| case.hyperparameters.multiplier_max = *value);
+    cases = get_sweep_cases_product(cases, &grid.pct_neutral, |case, value| case.hyperparameters.pct_neutral = *value);
+    cases = get_sweep_cases_product(cases, &grid.prop_balance_1d_max, |case, value| {
+        case.hyperparameters.prop_balance_1d_max = *value
+    });
+    cases = get_sweep_cases_product(cases, &grid.prop_budget_step_max, |case, value| {
+        case.hyperparameters.prop_budget_step_max = *value
+    });
+    cases = get_sweep_cases_product(cases, &grid.pct_reserve_unlock, |case, value| {
+        case.hyperparameters.pct_reserve_unlock = *value
+    });
+    cases = get_sweep_cases_product(cases, &grid.days_runway, |case, value| case.hyperparameters.days_runway = *value);
+    cases
+}
+
+/// Windows of `n_days_window` starting every `n_days_window_step` days, all ending by `datetime_last`
+fn get_sweep_windows(grid: &SweepGrid, datetime_last: NaiveDateTime) -> Vec<(NaiveDateTime, NaiveDateTime)> {
+    let mut windows: Vec<(NaiveDateTime, NaiveDateTime)> = Vec::new();
+    let mut datetime_start = datetime_last - Duration::days(grid.n_days_last);
+    loop {
+        let datetime_end = datetime_start + Duration::days(grid.n_days_window);
+        if datetime_end > datetime_last {
+            break;
+        }
+        windows.push((datetime_start, datetime_end));
+        datetime_start += Duration::days(grid.n_days_window_step);
+    }
+    windows
+}
+
+fn get_sweep_line(case: &SweepCase, result: &SimulatorResult) -> String {
+    let metrics = get_simulator_metrics(result);
+    let hyperparameters = &case.hyperparameters;
+    format!(
+        "{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.6},{:.6},{:.6},{:.4},{:.4},{}",
+        case.balance_reserve,
+        hyperparameters.multiplier_max,
+        hyperparameters.pct_neutral,
+        hyperparameters.prop_balance_1d_max,
+        hyperparameters.prop_budget_step_max,
+        hyperparameters.pct_reserve_unlock,
+        hyperparameters.days_runway,
+        result.datetime_start,
+        result.amount_deposited.amount,
+        result.amount_spent.amount,
+        result.balance.amount,
+        metrics.roi,
+        metrics.roi_dca,
+        metrics.roi_neutral,
+        metrics.prop_steps_below_reserve,
+        metrics.prop_spent_first_half,
+        result.n_purchases
+    )
+}
+
+/// Runs `jobs` on one thread per core, each with its own single-threaded runtime, and returns one CSV line per
+/// job in job order. A failed job logs and leaves its line out
+fn run_sweep_jobs(
+    grid: &SweepGrid,
+    cases: &[SweepCase],
+    jobs: &[SweepJob],
+    prices: &SimulatorPrices,
+) -> anyhow::Result<Vec<String>> {
+    let n_threads = std::thread::available_parallelism()?.get();
+    let index_job_next = std::sync::atomic::AtomicUsize::new(0);
+    let lines: std::sync::Mutex<Vec<Option<String>>> = std::sync::Mutex::new(vec![None; jobs.len()]);
+    let amount_buy_min = match grid.amount_buy_min {
+        Some(amount_buy_min) => Some(Amount::init(currency_market, amount_buy_min)),
+        None => None,
+    };
+    let deposit_1d = Amount::init(currency_market, grid.deposit_1d);
+    let deposit_initial = Amount::init(currency_market, 0.0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..n_threads {
+            scope.spawn(|| {
+                let runtime = match tokio::runtime::Builder::new_current_thread().build() {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        log::error!("Failed to build a sweep runtime: {}", e);
+                        return;
+                    }
+                };
+                loop {
+                    let index_job = index_job_next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if index_job >= jobs.len() {
+                        break;
+                    }
+                    let job = &jobs[index_job];
+                    let case = &cases[job.index_case];
+                    let algorithm = Algorithm_v1_0::init(case.hyperparameters.clone());
+                    let params = AlgorithmParams {
+                        deposit_1d: deposit_1d.clone(),
+                        amount_buy_min: amount_buy_min.clone(),
+                        balance_reserve: Amount::init(currency_market, case.balance_reserve),
+                    };
+                    let simulation = run_simulation(
+                        &algorithm,
+                        prices,
+                        job.datetime_start,
+                        job.datetime_end,
+                        &params,
+                        &deposit_initial,
+                        &deposit_1d,
+                        false,
+                    );
+                    let result = match runtime.block_on(simulation) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!("Sweep job {} failed: {}", index_job, e);
+                            continue;
+                        }
+                    };
+                    let line = get_sweep_line(case, &result);
+                    match lines.lock() {
+                        Ok(mut lines) => lines[index_job] = Some(line),
+                        Err(e) => log::error!("Lock on sweep lines poisoned: {}", e),
+                    }
+                    if index_job % 100 == 0 {
+                        log::info!("Sweep job {}/{}", index_job, jobs.len());
+                    }
+                }
+            });
+        }
+    });
+
+    let lines = match lines.into_inner() {
+        Ok(lines) => lines,
+        Err(e) => return Err(anyhow!("Lock on sweep lines poisoned: {}", e)),
+    };
+    let mut lines_done: Vec<String> = Vec::new();
+    for line in lines {
+        if let Some(line) = line {
+            lines_done.push(line);
+        }
+    }
+    Ok(lines_done)
+}
+
+/// Backtests every combination in the grid at `grid_toml_path` on every window, starting each window from an
+/// empty balance, and writes one row per combination and window to `results_csv_path`
+fn run_sweep(config: &Config, grid_toml_path: &str, results_csv_path: &str) -> anyhow::Result<()> {
+    let grid_str = std::fs::read_to_string(grid_toml_path)?;
+    let grid: SweepGrid = toml::from_str(&grid_str)?;
+    if grid.n_days_window <= 0 || grid.n_days_window_step <= 0 || grid.n_days_last < grid.n_days_window {
+        return Err(anyhow!(
+            "Invalid windows: 'n_days_window' {} and 'n_days_window_step' {} must be positive and fit in 'n_days_last' {}",
+            grid.n_days_window,
+            grid.n_days_window_step,
+            grid.n_days_last
+        ));
+    }
+
+    let database = Database::init(config.clone())?;
+    let days_closing = grid.n_days_last as i32 + days_history_closing;
+    let days_intraday = grid.n_days_last as i32 + days_history_intraday;
+    let prices_closing = database.get_prices_last(coin, days_closing, true)?;
+    let prices_intraday = database.get_prices_last(coin, days_intraday, false)?;
+    let datetime_last = match prices_intraday.last() {
+        Some(price_row_last) => price_row_last.timestamp,
+        None => return Err(anyhow!("No intraday prices in the database")),
+    };
+    let datetime_first = datetime_last - Duration::days(grid.n_days_last);
+    let prices = SimulatorPrices::init(&prices_closing, prices_intraday, datetime_first);
+
+    let cases = get_sweep_cases(&grid);
+    let windows = get_sweep_windows(&grid, datetime_last);
+    let mut jobs: Vec<SweepJob> = Vec::new();
+    for index_case in 0..cases.len() {
+        for (datetime_start, datetime_end) in &windows {
+            jobs.push(SweepJob { index_case, datetime_start: *datetime_start, datetime_end: *datetime_end });
+        }
+    }
+    log::info!("Sweeping {} case(s) over {} window(s), {} job(s)", cases.len(), windows.len(), jobs.len());
+
+    let lines_job = run_sweep_jobs(&grid, &cases, &jobs, &prices)?;
+    let header = "balance_reserve,multiplier_max,pct_neutral,prop_balance_1d_max,prop_budget_step_max,pct_reserve_unlock,days_runway,datetime_start,deposited,spent,balance,roi,roi_dca,roi_neutral,prop_steps_below_reserve,prop_spent_first_half,n_purchases";
+    let mut lines: Vec<String> = vec![header.to_string()];
+    lines.extend(lines_job);
+    std::fs::write(results_csv_path, lines.join("\n"))?;
+    log::info!("Saved {} row(s) to {}", lines.len() - 1, results_csv_path);
+    Ok(())
 }
 
 async fn run_simulator() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let config = Config::init();
+
+    if args.get(1).map(String::as_str) == Some("sweep") {
+        let (grid_toml_path, results_csv_path) = match (args.get(2), args.get(3)) {
+            (Some(grid_toml_path), Some(results_csv_path)) => (grid_toml_path, results_csv_path),
+            _ => return Err(anyhow!("Usage: simulator sweep <grid_toml_path> <results_csv_path>")),
+        };
+        return run_sweep(&config, grid_toml_path, results_csv_path);
+    }
 
     let n_days_last_str: Option<String> = args.get(1).cloned();
     let n_days_last: i64 = match n_days_last_str {
@@ -364,7 +711,18 @@ async fn run_simulator() -> anyhow::Result<()> {
             .map_err(|e| anyhow!("Invalid deposit_1d_simulated '{}': {}", deposit_1d_simulated_str, e))?,
         None => deposit_1d,
     };
-    let deposit_1d = Amount::init(currency_market, deposit_1d);
+    // Missing means no reserve, matching the daemon
+    let balance_reserve: f64 = match args.get(6) {
+        Some(balance_reserve_str) => balance_reserve_str
+            .parse()
+            .map_err(|e| anyhow!("Invalid balance_reserve '{}': {}", balance_reserve_str, e))?,
+        None => config.get_config("balance_reserve")?.unwrap_or(0.0),
+    };
+    let params = AlgorithmParams {
+        deposit_1d: Amount::init(currency_market, deposit_1d),
+        amount_buy_min,
+        balance_reserve: Amount::init(currency_market, balance_reserve),
+    };
     let deposit_initial = Amount::init(currency_market, deposit_initial);
     let deposit_1d_simulated = Amount::init(currency_market, deposit_1d_simulated);
 
@@ -379,20 +737,27 @@ async fn run_simulator() -> anyhow::Result<()> {
         prices_intraday.len(),
         algorithm_name
     );
+    let datetime_end = match prices_intraday.last() {
+        Some(price_row_last) => price_row_last.timestamp,
+        None => return Err(anyhow!("No intraday prices in the database")),
+    };
+    let datetime_start = datetime_end - Duration::days(n_days_last);
+    let prices = SimulatorPrices::init(&prices_closing, prices_intraday, datetime_start);
 
+    let path_csv = args.get(3);
     let result = run_simulation(
         algorithm.as_ref(),
-        &prices_closing,
-        &prices_intraday,
-        n_days_last,
-        &deposit_1d,
+        &prices,
+        datetime_start,
+        datetime_end,
+        &params,
         &deposit_initial,
         &deposit_1d_simulated,
-        &amount_buy_min,
+        path_csv.is_some(),
     )
     .await?;
     log_simulator_result(&result);
-    if let Some(path_csv) = args.get(3) {
+    if let Some(path_csv) = path_csv {
         save_simulator_steps(&result.steps, path_csv)?;
         log::info!("Saved {} step(s) to {}", result.steps.len(), path_csv);
     }

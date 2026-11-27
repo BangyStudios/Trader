@@ -1,4 +1,4 @@
-use crate::algorithm::v1_0::Algorithm_v1_0;
+use crate::algorithm::v1_0::{Algorithm_v1_0, Hyperparameters_v1_0};
 use crate::algorithm::Algorithm;
 use crate::daemon::Daemon;
 use crate::quant::moving_average::get_timeseries_ma_trailing;
@@ -114,6 +114,7 @@ impl Daemon {
         let params = AlgorithmParams {
             deposit_1d: self.deposit_1d.clone(),
             amount_buy_min: self.amount_buy_min.clone(),
+            balance_reserve: self.balance_reserve.clone(),
         };
         let input = AlgorithmInput {
             datetime_now,
@@ -153,7 +154,7 @@ impl Daemon {
     }
 
     pub async fn loop_run_algorithm(&self) {
-        let algorithm = Algorithm_v1_0::init();
+        let algorithm = Algorithm_v1_0::init(Hyperparameters_v1_0::default());
         loop {
             match self.run_algorithm(&algorithm).await {
                 Ok(()) => {}

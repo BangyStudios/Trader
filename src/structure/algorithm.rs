@@ -5,6 +5,7 @@ use chrono::NaiveDateTime;
 pub struct AlgorithmParams {
     pub deposit_1d: Amount, // Amount deposited into CEx balance per day
     pub amount_buy_min: Option<Amount>, // Minimum purchase amount per transaction
+    pub balance_reserve: Amount, // Balance kept back for exceptional prices, 0 for none
 }
 
 pub struct AlgorithmInput {

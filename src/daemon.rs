@@ -20,6 +20,7 @@ pub struct Daemon {
     currency_market: String, // Currency that the balance, deposits and orders are in
     deposit_1d: Amount,
     amount_buy_min: Option<Amount>,
+    balance_reserve: Amount,
     is_wet_run: bool, // Places real orders when true, otherwise only logs them
 }
 
@@ -50,6 +51,10 @@ impl Daemon {
             Some(amount_buy_min) => Some(Amount::init(&currency_market, amount_buy_min)),
             None => None,
         };
+        // Missing means no reserve
+        let balance_reserve: f64 = config.get_config("balance_reserve")?.unwrap_or(0.0);
+        let balance_reserve = Amount::init(&currency_market, balance_reserve);
+        log::info!("Balance reserve: {:.2}", balance_reserve);
 
         // Missing means dry run, so an incomplete config never trades
         let is_wet_run: bool = config.get_config("is_wet_run")?.unwrap_or(false);
@@ -66,6 +71,7 @@ impl Daemon {
             currency_market,
             deposit_1d,
             amount_buy_min,
+            balance_reserve,
             is_wet_run,
         });
     }
